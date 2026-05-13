@@ -8,6 +8,7 @@ import { Link, useLocation } from 'wouter';
 import {
   LayoutDashboard, Settings2, Camera, ClipboardList,
   Activity, Wifi, WifiOff, Menu, X, ChevronLeft, ChevronRight,
+  Film, Cog,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useSession } from '@/contexts/SessionContext';
@@ -16,7 +17,9 @@ const NAV_ITEMS = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/setup', label: 'Task Setup', icon: Settings2 },
   { href: '/scan', label: 'Live Scan', icon: Camera },
+  { href: '/upload', label: 'Upload Video', icon: Film },
   { href: '/sessions', label: 'Sessions', icon: ClipboardList },
+  { href: '/settings', label: 'Settings', icon: Cog },
 ];
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {

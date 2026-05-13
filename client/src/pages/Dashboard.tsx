@@ -3,7 +3,7 @@
  * Home page: KPI summary, recent sessions, quick-start CTA.
  */
 import { Link } from 'wouter';
-import { Camera, ClipboardList, Activity, AlertTriangle, ChevronRight, Zap } from 'lucide-react';
+import { Camera, ClipboardList, Activity, AlertTriangle, ChevronRight, Zap, Upload, Wrench, FileVideo } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { useSession } from '@/contexts/SessionContext';
@@ -31,6 +31,8 @@ export default function Dashboard() {
   const avgReba = totalSessions
     ? Math.round((sessions.reduce((s, x) => s + x.avgReba, 0) / totalSessions) * 10) / 10
     : 0;
+  const openActions = sessions.reduce((sum, s) => sum + (s.actions ?? []).filter(a => a.status === 'open' || a.status === 'in-progress').length, 0);
+  const videoSessions = sessions.filter(s => s.source === 'video-upload').length;
 
   const chartData = sessions.slice(0, 7).reverse().map((s, i) => ({
     name: `S${i + 1}`,
@@ -52,18 +54,27 @@ export default function Dashboard() {
             Computer vision–powered workplace risk monitoring
           </p>
         </div>
-        <Link href="/scan">
-          <Button className="gap-2 bg-[oklch(0.28_0.07_240)] hover:bg-[oklch(0.35_0.07_240)] text-white">
-            <Camera className="w-4 h-4" /> Start Live Scan
-          </Button>
-        </Link>
+        <div className="flex items-center gap-2">
+          <Link href="/upload">
+            <Button variant="outline" className="gap-2">
+              <Upload className="w-4 h-4" /> Upload Video
+            </Button>
+          </Link>
+          <Link href="/scan">
+            <Button className="gap-2 bg-[oklch(0.28_0.07_240)] hover:bg-[oklch(0.35_0.07_240)] text-white">
+              <Camera className="w-4 h-4" /> Live Scan
+            </Button>
+          </Link>
+        </div>
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <KpiCard label="Total Sessions" value={totalSessions} icon={<ClipboardList className="w-4 h-4" />} color="blue" />
-        <KpiCard label="High Risk Sessions" value={highRiskSessions} icon={<AlertTriangle className="w-4 h-4" />} color={highRiskSessions > 0 ? 'red' : 'green'} />
-        <KpiCard label="Avg RULA Score" value={avgRula} icon={<Activity className="w-4 h-4" />} color={avgRula >= 5 ? 'red' : avgRula >= 3 ? 'amber' : 'green'} suffix="/7" />
-        <KpiCard label="Avg REBA Score" value={avgReba} icon={<Zap className="w-4 h-4" />} color={avgReba >= 8 ? 'red' : avgReba >= 4 ? 'amber' : 'green'} suffix="/15" />
+      <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+        <KpiCard label="Total Assessments" value={totalSessions} icon={<ClipboardList className="w-4 h-4" />} color="blue" />
+        <KpiCard label="Video Uploads" value={videoSessions} icon={<FileVideo className="w-4 h-4" />} color="blue" />
+        <KpiCard label="High Risk" value={highRiskSessions} icon={<AlertTriangle className="w-4 h-4" />} color={highRiskSessions > 0 ? 'red' : 'green'} />
+        <KpiCard label="Open Actions" value={openActions} icon={<Wrench className="w-4 h-4" />} color={openActions > 0 ? 'amber' : 'green'} />
+        <KpiCard label="Avg RULA" value={avgRula} icon={<Activity className="w-4 h-4" />} color={avgRula >= 5 ? 'red' : avgRula >= 3 ? 'amber' : 'green'} suffix="/7" />
+        <KpiCard label="Avg REBA" value={avgReba} icon={<Zap className="w-4 h-4" />} color={avgReba >= 8 ? 'red' : avgReba >= 4 ? 'amber' : 'green'} suffix="/15" />
       </div>
 
       <div className="grid lg:grid-cols-5 gap-5">
@@ -144,7 +155,7 @@ export default function Dashboard() {
             <div className="grid sm:grid-cols-3 gap-4">
               {[
                 { step: '1', title: 'Configure Task', desc: 'Set load weight, rep rate, and NIOSH parameters for your task.', href: '/setup', cta: 'Task Setup' },
-                { step: '2', title: 'Start Live Scan', desc: 'Enable your camera. ErgoKit automatically tracks your skeleton and calculates risk scores.', href: '/scan', cta: 'Live Scan' },
+                { step: '2', title: 'Upload Video or Live Scan', desc: 'Upload a task video for automated frame-by-frame analysis, or use your live camera for real-time assessment.', href: '/upload', cta: 'Upload Video' },
                 { step: '3', title: 'Review Report', desc: 'After recording, view detailed angle analysis and automated recommendations.', href: '/sessions', cta: 'Sessions' },
               ].map(({ step, title, desc, href, cta }) => (
                 <div key={step} className="flex gap-3">

@@ -21,11 +21,12 @@ interface SessionContextValue {
 
   // Saved sessions
   sessions: SessionRecord[];
+  addSession: (record: SessionRecord) => void;
   deleteSession: (id: string) => void;
   clearAllSessions: () => void;
 }
 
-const SessionContext = createContext<SessionContextValue | null>(null);
+export const SessionContext = createContext<SessionContextValue | null>(null);
 
 export function SessionProvider({ children }: { children: React.ReactNode }) {
   const [isRecording, setIsRecording] = useState(false);
@@ -85,6 +86,10 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     setCurrentSnapshots(prev => [...prev.slice(-300), snap]); // keep last 300
   }, [isRecording]);
 
+  const addSession = useCallback((record: SessionRecord) => {
+    setSessions(prev => [record, ...prev].slice(0, 100));
+  }, []);
+
   const deleteSession = useCallback((id: string) => {
     setSessions(prev => prev.filter(s => s.id !== id));
   }, []);
@@ -97,7 +102,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     <SessionContext.Provider value={{
       isRecording, sessionDuration, currentSnapshots, taskProfile,
       setTaskProfile, startRecording, stopRecording, pushSnapshot,
-      sessions, deleteSession, clearAllSessions,
+      sessions, addSession, deleteSession, clearAllSessions,
     }}>
       {children}
     </SessionContext.Provider>

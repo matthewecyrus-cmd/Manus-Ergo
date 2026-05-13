@@ -650,7 +650,34 @@ export function riskLabel(level: RiskLevel): string {
   return map[level];
 }
 
+// ─── CORRECTIVE ACTIONS ──────────────────────────────────────────────────────
+export type ActionPriority = 'critical' | 'high' | 'medium' | 'low';
+export type ActionStatus = 'open' | 'in-progress' | 'completed' | 'verified';
+
+export interface CorrectiveAction {
+  id: string;
+  description: string;
+  category: 'engineering' | 'administrative' | 'ppe' | 'training';
+  priority: ActionPriority;
+  status: ActionStatus;
+  owner?: string;
+  dueDate?: string;
+  completedDate?: string;
+  notes?: string;
+  riskDriver: string; // which body region / score drove this
+}
+
+// ─── BODY REGION RISK ────────────────────────────────────────────────────────
+export interface BodyRegionRisk {
+  region: string;
+  score: number;     // 0–10
+  riskLevel: RiskLevel;
+  primaryAngles: string; // e.g. "Flexion: 35°"
+}
+
 // ─── SESSION STORAGE ─────────────────────────────────────────────────────────
+export type SessionSource = 'camera' | 'video-upload';
+
 export interface SessionRecord {
   id: string;
   taskName: string;
@@ -663,12 +690,118 @@ export interface SessionRecord {
   avgRsi: number;
   peakRisk: RiskLevel;
   taskProfile: TaskProfile;
+  // New fields
+  source: SessionSource;
+  assessor?: string;
+  department?: string;
+  location?: string;
+  notes?: string;
+  actions: CorrectiveAction[];
+  bodyRegions: BodyRegionRisk[];
+  recommendations: string[];
+  /** ID of a previous session this is a reassessment of */
+  baselineSessionId?: string;
+  /** Thumbnail data URL from a key frame */
+  thumbnailDataUrl?: string;
+}
+
+// ─── BODY REGION RISK BUILDER ────────────────────────────────────────────────
+export function buildBodyRegions(snapshots: ErgoSnapshot[]): BodyRegionRisk[] {
+  if (!snapshots.length) return [];
+  const avgA = (fn: (s: ErgoSnapshot) => number) =>
+    snapshots.reduce((s, x) => s + fn(x), 0) / snapshots.length;
+
+  const score = (raw: number, max: number) => Math.min(10, Math.round((raw / max) * 10 * 10) / 10);
+  const rl = (s: number): RiskLevel => s >= 8 ? 'very-high' : s >= 6 ? 'high' : s >= 4 ? 'medium' : s >= 2 ? 'low' : 'negligible';
+
+  const neckFlex = avgA(s => s.angles.neckFlexion);
+  const trunkFlex = avgA(s => s.angles.trunkFlexion);
+  const trunkRot = avgA(s => s.angles.trunkRotation);
+  const lUA = avgA(s => s.angles.leftUpperArm);
+  const rUA = avgA(s => s.angles.rightUpperArm);
+  const lLA = avgA(s => s.angles.leftLowerArm);
+  const rLA = avgA(s => s.angles.rightLowerArm);
+  const lWr = avgA(s => s.angles.leftWrist);
+  const rWr = avgA(s => s.angles.rightWrist);
+  const knee = avgA(s => Math.max(s.angles.leftKnee, s.angles.rightKnee));
+  const hip = avgA(s => s.angles.hipFlexion);
+
+  const regions: BodyRegionRisk[] = [
+    { region: 'Neck',        score: score(neckFlex, 45),          riskLevel: rl(score(neckFlex, 45)),          primaryAngles: `Flexion: ${neckFlex.toFixed(1)}°` },
+    { region: 'Upper Back',  score: score(trunkFlex, 90),         riskLevel: rl(score(trunkFlex, 90)),         primaryAngles: `Flexion: ${trunkFlex.toFixed(1)}°` },
+    { region: 'Lower Back',  score: score(trunkRot + trunkFlex * 0.5, 90), riskLevel: rl(score(trunkRot + trunkFlex * 0.5, 90)), primaryAngles: `Rotation: ${trunkRot.toFixed(1)}°` },
+    { region: 'L. Shoulder', score: score(lUA, 90),               riskLevel: rl(score(lUA, 90)),               primaryAngles: `Elevation: ${lUA.toFixed(1)}°` },
+    { region: 'R. Shoulder', score: score(rUA, 90),               riskLevel: rl(score(rUA, 90)),               primaryAngles: `Elevation: ${rUA.toFixed(1)}°` },
+    { region: 'L. Elbow',    score: score(Math.abs(lLA - 90), 90), riskLevel: rl(score(Math.abs(lLA - 90), 90)), primaryAngles: `Angle: ${lLA.toFixed(1)}°` },
+    { region: 'R. Elbow',    score: score(Math.abs(rLA - 90), 90), riskLevel: rl(score(Math.abs(rLA - 90), 90)), primaryAngles: `Angle: ${rLA.toFixed(1)}°` },
+    { region: 'L. Wrist',    score: score(lWr, 40),               riskLevel: rl(score(lWr, 40)),               primaryAngles: `Deviation: ${lWr.toFixed(1)}°` },
+    { region: 'R. Wrist',    score: score(rWr, 40),               riskLevel: rl(score(rWr, 40)),               primaryAngles: `Deviation: ${rWr.toFixed(1)}°` },
+    { region: 'Hips',        score: score(hip, 90),               riskLevel: rl(score(hip, 90)),               primaryAngles: `Flexion: ${hip.toFixed(1)}°` },
+    { region: 'Knees',       score: score(Math.abs(knee - 180), 90), riskLevel: rl(score(Math.abs(knee - 180), 90)), primaryAngles: `Bend: ${(180 - knee).toFixed(1)}°` },
+  ];
+  return regions.sort((a, b) => b.score - a.score);
+}
+
+// ─── AI RECOMMENDATIONS GENERATOR ────────────────────────────────────────────
+export function generateRecommendations(
+  snapshots: ErgoSnapshot[],
+  task: TaskProfile,
+): string[] {
+  if (!snapshots.length) return [];
+  const recs: string[] = [];
+  const avgA = (fn: (s: ErgoSnapshot) => number) =>
+    snapshots.reduce((s, x) => s + fn(x), 0) / snapshots.length;
+
+  const neckFlex = avgA(s => s.angles.neckFlexion);
+  const trunkFlex = avgA(s => s.angles.trunkFlexion);
+  const trunkRot = avgA(s => s.angles.trunkRotation);
+  const maxUA = avgA(s => Math.max(s.angles.leftUpperArm, s.angles.rightUpperArm));
+  const maxWr = avgA(s => Math.max(s.angles.leftWrist, s.angles.rightWrist));
+  const avgRula = avgA(s => s.rula.score);
+  const avgReba = avgA(s => s.reba.score);
+  const nioshLI = task.loadWeight / Math.max(0.01, 23 * (task.horizontalDistance > 0 ? Math.min(1, 25 / task.horizontalDistance) : 1));
+
+  if (neckFlex > 20) recs.push(`Neck flexion averaged ${neckFlex.toFixed(0)}°. Raise the work surface or monitor to bring the head to a neutral position (0–10°).`);
+  if (trunkFlex > 20) recs.push(`Trunk flexion averaged ${trunkFlex.toFixed(0)}°. Adjust workstation height to allow an upright posture. Consider a height-adjustable table.`);
+  if (trunkRot > 15) recs.push(`Trunk rotation averaged ${trunkRot.toFixed(0)}°. Reposition materials to the front of the worker to eliminate twisting.`);
+  if (maxUA > 45) recs.push(`Shoulder elevation averaged ${maxUA.toFixed(0)}°. Lower the work surface or use a tool with an extended handle to reduce overhead reach.`);
+  if (maxWr > 15) recs.push(`Wrist deviation averaged ${maxWr.toFixed(0)}°. Use a neutral-grip tool or reorient the work piece to straighten the wrist.`);
+  if (task.repRate > 10) recs.push(`Repetition rate of ${task.repRate} reps/min is high. Introduce job rotation every 30–60 minutes to distribute exposure.`);
+  if (task.loadWeight > 15) recs.push(`Load weight of ${task.loadWeight} kg exceeds recommended limits. Use a mechanical assist (hoist, lift table, or cart) for loads above 15 kg.`);
+  if (nioshLI > 1) recs.push(`NIOSH Lifting Index of ${nioshLI.toFixed(2)} indicates risk. Reduce load, shorten horizontal reach, or raise the lift origin height.`);
+  if (avgRula >= 5) recs.push(`RULA score of ${avgRula.toFixed(1)} requires prompt investigation. Conduct a detailed ergonomics review with a qualified ergonomist.`);
+  if (avgReba >= 8) recs.push(`REBA score of ${avgReba.toFixed(1)} indicates high whole-body risk. Prioritize engineering controls before administrative measures.`);
+  if (task.duration === 'long' && task.repRate > 4) recs.push('Long-duration repetitive task. Schedule mandatory micro-breaks every 20–30 minutes and provide stretching guidance.');
+
+  if (recs.length === 0) recs.push('Posture and task parameters are within acceptable limits. Continue to monitor and reassess if the task changes.');
+  return recs;
+}
+
+// ─── AUTO-GENERATE CORRECTIVE ACTIONS ────────────────────────────────────────
+export function generateActions(snapshots: ErgoSnapshot[], task: TaskProfile): CorrectiveAction[] {
+  const recs = generateRecommendations(snapshots, task);
+  const avgA = (fn: (s: ErgoSnapshot) => number) =>
+    snapshots.length ? snapshots.reduce((s, x) => s + fn(x), 0) / snapshots.length : 0;
+  const avgRula = avgA(s => s.rula.score);
+  const avgReba = avgA(s => s.reba.score);
+
+  return recs.map((rec, i) => ({
+    id: `ACT-${Date.now().toString(36).toUpperCase()}-${i}`,
+    description: rec,
+    category: rec.includes('mechanical') || rec.includes('height') || rec.includes('tool') ? 'engineering' :
+               rec.includes('rotation') || rec.includes('break') ? 'administrative' : 'engineering',
+    priority: (avgRula >= 6 || avgReba >= 10) ? 'critical' : (avgRula >= 4 || avgReba >= 7) ? 'high' : 'medium',
+    status: 'open',
+    riskDriver: rec.split('.')[0],
+  }));
 }
 
 export function summarizeSession(
   snapshots: ErgoSnapshot[],
   task: TaskProfile,
   durationSec: number,
+  source: SessionSource = 'camera',
+  meta?: { assessor?: string; department?: string; location?: string; notes?: string; thumbnailDataUrl?: string },
 ): SessionRecord {
   const avg = (fn: (s: ErgoSnapshot) => number) =>
     snapshots.length ? snapshots.reduce((s, x) => s + fn(x), 0) / snapshots.length : 0;
@@ -689,5 +822,14 @@ export function summarizeSession(
     avgRsi: Math.round(avg(s => s.rsi.score) * 10) / 10,
     peakRisk,
     taskProfile: task,
+    source,
+    assessor: meta?.assessor,
+    department: meta?.department,
+    location: meta?.location,
+    notes: meta?.notes,
+    thumbnailDataUrl: meta?.thumbnailDataUrl,
+    actions: generateActions(snapshots, task),
+    bodyRegions: buildBodyRegions(snapshots),
+    recommendations: generateRecommendations(snapshots, task),
   };
 }
