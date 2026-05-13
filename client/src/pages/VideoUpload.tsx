@@ -455,12 +455,12 @@ export default function VideoUpload() {
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Reassessment of (Session ID)</Label>
-                <Select value={baselineId} onValueChange={setBaselineId}>
+                <Select value={baselineId || 'none'} onValueChange={v => setBaselineId(v === 'none' ? '' : v)}>
                   <SelectTrigger className="h-8 text-xs">
                     <SelectValue placeholder="None (new assessment)" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">None (new assessment)</SelectItem>
+                    <SelectItem value="none">None (new assessment)</SelectItem>
                     {sessions.map(s => (
                       <SelectItem key={s.id} value={s.id}>{s.id} — {s.taskName}</SelectItem>
                     ))}
