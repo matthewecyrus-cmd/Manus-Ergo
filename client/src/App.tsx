@@ -1,32 +1,26 @@
-/* ============================================================
-   ErgoKit — App Router
-   Design: Clinical Dashboard — DM Sans headings + Inter body
-   Routes: Dashboard / Assessments / New Assessment (RULA/REBA wizard) / Reports / Settings
-   ============================================================ */
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/NotFound";
 import { Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
+import { SessionProvider } from "./contexts/SessionContext";
 import DashboardLayout from "./components/DashboardLayout";
 import Dashboard from "./pages/Dashboard";
-import Assessments from "./pages/Assessments";
-import AssessmentDetail from "./pages/AssessmentDetail";
-import NewAssessment from "./pages/NewAssessment";
-import Reports from "./pages/Reports";
-import Settings from "./pages/Settings";
+import TaskSetup from "./pages/TaskSetup";
+import LiveScan from "./pages/LiveScan";
+import Sessions from "./pages/Sessions";
+import SessionReport from "./pages/SessionReport";
 
 function Router() {
   return (
     <DashboardLayout>
       <Switch>
         <Route path="/" component={Dashboard} />
-        <Route path="/assessments" component={Assessments} />
-        <Route path="/assessments/new" component={NewAssessment} />
-        <Route path="/assessments/:id" component={AssessmentDetail} />
-        <Route path="/reports" component={Reports} />
-        <Route path="/settings" component={Settings} />
+        <Route path="/setup" component={TaskSetup} />
+        <Route path="/scan" component={LiveScan} />
+        <Route path="/sessions" component={Sessions} />
+        <Route path="/sessions/:id" component={SessionReport} />
         <Route path="/404" component={NotFound} />
         <Route component={NotFound} />
       </Switch>
@@ -38,10 +32,12 @@ function App() {
   return (
     <ErrorBoundary>
       <ThemeProvider defaultTheme="light">
-        <TooltipProvider>
-          <Toaster />
-          <Router />
-        </TooltipProvider>
+        <SessionProvider>
+          <TooltipProvider>
+            <Toaster />
+            <Router />
+          </TooltipProvider>
+        </SessionProvider>
       </ThemeProvider>
     </ErrorBoundary>
   );
