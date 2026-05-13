@@ -1,60 +1,395 @@
 /**
  * SessionReport — ErgoKit
- * ========================
+ * =======================
  * Design: Clinical Dashboard — deep navy sidebar, sky-blue accents, ISO risk colors
  *
- * Full assessment record view:
- *   - Score summary (RULA, REBA, NIOSH, RSI) with risk badges
- *   - Risk score timeline chart
- *   - Body-region risk heat map (sorted by severity)
- *   - AI-generated plain-language recommendations
- *   - Corrective actions tracker (owner, due date, priority, status)
- *   - Before/after comparison (if this is a reassessment)
- *   - Print / PDF export
+ * Sections:
+ *   1. Header — session metadata, risk badge, print button
+ *   2. Plain-English Summary — "What does this mean?" for non-ergonomists
+ *   3. Score Cards — RULA, REBA, NIOSH LI, RSI with full layperson explanations
+ *   4. Video Replay — original video with live skeleton overlay (video-upload sessions)
+ *   5. Body Region Risk Map — color-coded bar chart
+ *   6. Average Joint Angles — with safe-range annotations
+ *   7. Risk Score Timeline — recharts line chart
+ *   8. AI-Generated Recommendations — plain-language, numbered
+ *   9. Corrective Actions — owner/status tracker
+ *  10. Before/After Comparison (if reassessment)
  */
-import { useState, useCallback } from 'react';
-import { useParams, Link } from 'wouter';
+import { useRef, useState, useCallback, useEffect } from 'react';
+import { useParams, useLocation, Link } from 'wouter';
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ReferenceLine, Legend, BarChart, Bar, Cell,
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip,
+  ResponsiveContainer, ReferenceLine, BarChart, Bar, Cell,
 } from 'recharts';
 import {
-  ArrowLeft, Printer, Clock, Calendar, User, Building2, MapPin,
-  CheckCircle2, Circle, AlertTriangle, ChevronDown, ChevronUp,
-  FileVideo, Camera, GitCompare, Lightbulb, Wrench, ClipboardList,
-  TrendingDown, TrendingUp, Minus,
+  ArrowLeft, Printer, CheckCircle2, AlertTriangle, ChevronDown, ChevronUp,
+  Activity, Zap, TrendingUp, Shield, HelpCircle, Eye, Play, Pause,
+  RotateCcw, GitCompare, TrendingDown, Minus, Circle,
 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useSession } from '@/contexts/SessionContext';
-import {
-  riskBgClass, riskLabel, riskColor,
-  buildBodyRegions, generateRecommendations,
-} from '@/lib/ergo-engine';
-import type { CorrectiveAction, ActionStatus, ActionPriority, SessionRecord } from '@/lib/ergo-engine';
+import { riskBgClass, riskLabel, riskColor, buildBodyRegions, generateRecommendations } from '@/lib/ergo-engine';
+import { drawSkeleton } from '@/lib/skeleton-overlay';
 import { toast } from 'sonner';
+import type {
+  CorrectiveAction, ActionStatus, ActionPriority, SessionRecord, RiskLevel,
+} from '@/lib/ergo-engine';
 
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}m ${s}s`;
+// ─── Plain-English explainer data ────────────────────────────────────────────
+const SCORE_EXPLAINERS = {
+  rula: {
+    name: 'RULA', fullName: 'Rapid Upper Limb Assessment', icon: '💪',
+    whatIsIt: "RULA measures how risky your worker's arm, wrist, neck, and shoulder positions are. Think of it as a 'posture danger score' for the upper body.",
+    scale: [
+      { range: '1–2', label: 'Acceptable', color: 'text-green-600', bg: 'bg-green-50 border-green-200', meaning: 'The posture is fine. No action needed.' },
+      { range: '3–4', label: 'Low Risk', color: 'text-yellow-600', bg: 'bg-yellow-50 border-yellow-200', meaning: 'Minor awkward positions. Worth watching, but not urgent.' },
+      { range: '5–6', label: 'Medium Risk', color: 'text-orange-600', bg: 'bg-orange-50 border-orange-200', meaning: 'Positions that can cause injury over time. Changes should be made soon.' },
+      { range: '7', label: 'High Risk', color: 'text-red-600', bg: 'bg-red-50 border-red-200', meaning: 'Immediate action required. This posture will cause injury if continued.' },
+    ],
+    actionLevel: (s: number) => s <= 2 ? { label: 'No action needed', color: 'text-green-600' }
+      : s <= 4 ? { label: 'Further investigation may be needed', color: 'text-yellow-600' }
+      : s <= 6 ? { label: 'Investigation and changes required soon', color: 'text-orange-600' }
+      : { label: 'Implement changes immediately', color: 'text-red-600' },
+    maxScore: 7,
+  },
+  reba: {
+    name: 'REBA', fullName: 'Rapid Entire Body Assessment', icon: '🧍',
+    whatIsIt: "REBA looks at the whole body — back, legs, neck, and overall posture. A high REBA score means the entire body is under stress, not just the arms.",
+    scale: [
+      { range: '1', label: 'Negligible', color: 'text-green-600', bg: 'bg-green-50 border-green-200', meaning: 'No risk. The posture is safe.' },
+      { range: '2–3', label: 'Low Risk', color: 'text-green-600', bg: 'bg-green-50 border-green-200', meaning: 'Low risk. Changes may be needed in the future.' },
+      { range: '4–7', label: 'Medium Risk', color: 'text-yellow-600', bg: 'bg-yellow-50 border-yellow-200', meaning: 'Medium risk. Further investigation and changes are needed.' },
+      { range: '8–10', label: 'High Risk', color: 'text-orange-600', bg: 'bg-orange-50 border-orange-200', meaning: 'High risk. Investigate and implement changes soon.' },
+      { range: '11–15', label: 'Very High Risk', color: 'text-red-600', bg: 'bg-red-50 border-red-200', meaning: 'Very high risk. Implement changes immediately.' },
+    ],
+    actionLevel: (s: number) => s <= 1 ? { label: 'No action needed', color: 'text-green-600' }
+      : s <= 3 ? { label: 'Changes may be needed', color: 'text-green-600' }
+      : s <= 7 ? { label: 'Further investigation and changes needed', color: 'text-yellow-600' }
+      : s <= 10 ? { label: 'Investigate and implement changes soon', color: 'text-orange-600' }
+      : { label: 'Implement changes immediately', color: 'text-red-600' },
+    maxScore: 15,
+  },
+  niosh: {
+    name: 'NIOSH LI', fullName: 'NIOSH Lifting Index', icon: '📦',
+    whatIsIt: "The NIOSH Lifting Index tells you whether the weight being lifted is safe for most people. It compares the actual load to the maximum recommended weight for that specific lifting situation.",
+    scale: [
+      { range: '< 1.0', label: 'Safe', color: 'text-green-600', bg: 'bg-green-50 border-green-200', meaning: 'The lift is safe for most workers. No changes needed.' },
+      { range: '1.0–2.0', label: 'Caution', color: 'text-yellow-600', bg: 'bg-yellow-50 border-yellow-200', meaning: 'Some workers may be at risk. Consider reducing the load or improving lifting conditions.' },
+      { range: '> 2.0', label: 'High Risk', color: 'text-red-600', bg: 'bg-red-50 border-red-200', meaning: 'Most workers are at significant risk of back injury. Redesign the task.' },
+    ],
+    actionLevel: (s: number) => s < 1 ? { label: 'Acceptable lift for most workers', color: 'text-green-600' }
+      : s < 2 ? { label: 'Some workers may be at risk — review conditions', color: 'text-yellow-600' }
+      : { label: 'High risk of back injury — redesign the task', color: 'text-red-600' },
+    maxScore: 3,
+  },
+  rsi: {
+    name: 'RSI', fullName: 'Repetitive Strain Index', icon: '🔄',
+    whatIsIt: "RSI measures the risk of repetitive strain injuries — the kind that build up over weeks from doing the same motion repeatedly. Think carpal tunnel, tendinitis, or chronic shoulder pain.",
+    scale: [
+      { range: '< 20', label: 'Low Risk', color: 'text-green-600', bg: 'bg-green-50 border-green-200', meaning: 'Low repetitive strain risk. The task is manageable.' },
+      { range: '20–40', label: 'Moderate Risk', color: 'text-yellow-600', bg: 'bg-yellow-50 border-yellow-200', meaning: 'Moderate risk. Consider job rotation or rest breaks.' },
+      { range: '> 40', label: 'High Risk', color: 'text-red-600', bg: 'bg-red-50 border-red-200', meaning: 'High risk of repetitive strain injury. Engineering controls recommended.' },
+    ],
+    actionLevel: (s: number) => s < 20 ? { label: 'Low strain risk', color: 'text-green-600' }
+      : s < 40 ? { label: 'Moderate risk — consider job rotation or breaks', color: 'text-yellow-600' }
+      : { label: 'High strain risk — engineering controls recommended', color: 'text-red-600' },
+    maxScore: 60,
+  },
+} as const;
+
+const ANGLE_SAFE_RANGES: Record<string, { safe: [number, number]; label: string }> = {
+  neckFlexion:   { safe: [-20, 20],  label: 'Neck Flexion' },
+  trunkFlexion:  { safe: [-20, 20],  label: 'Trunk Flexion' },
+  leftUpperArm:  { safe: [0, 20],    label: 'L. Shoulder Elevation' },
+  rightUpperArm: { safe: [0, 20],    label: 'R. Shoulder Elevation' },
+  leftWrist:     { safe: [-15, 15],  label: 'L. Wrist Deviation' },
+  rightWrist:    { safe: [-15, 15],  label: 'R. Wrist Deviation' },
+  hipFlexion:    { safe: [-30, 30],  label: 'Hip Flexion' },
+  leftKnee:      { safe: [0, 30],    label: 'L. Knee Bend' },
+  rightKnee:     { safe: [0, 30],    label: 'R. Knee Bend' },
+};
+
+function getAngleRisk(key: string, value: number): 'safe' | 'caution' | 'danger' {
+  const r = ANGLE_SAFE_RANGES[key];
+  if (!r) return 'safe';
+  const [lo, hi] = r.safe;
+  const margin = (hi - lo) * 0.5;
+  if (value >= lo && value <= hi) return 'safe';
+  if (value >= lo - margin && value <= hi + margin) return 'caution';
+  return 'danger';
+}
+function angleColor(risk: 'safe' | 'caution' | 'danger') {
+  return risk === 'safe' ? '#22c55e' : risk === 'caution' ? '#f59e0b' : '#ef4444';
 }
 
-function avg(arr: number[]) {
-  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+// ─── Risk badge ───────────────────────────────────────────────────────────────
+function RiskBadge({ level }: { level: RiskLevel }) {
+  const cls: Record<RiskLevel, string> = {
+    negligible: 'bg-green-100 text-green-800 border-green-200',
+    low: 'bg-green-100 text-green-800 border-green-200',
+    medium: 'bg-yellow-100 text-yellow-800 border-yellow-200',
+    high: 'bg-orange-100 text-orange-800 border-orange-200',
+    'very-high': 'bg-red-100 text-red-800 border-red-200',
+  };
+  const icons: Record<RiskLevel, string> = {
+    negligible: '🟢', low: '🟢', medium: '🟡', high: '🟠', 'very-high': '🔴',
+  };
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-semibold border ${cls[level]}`}>
+      {icons[level]} {riskLabel(level)}
+    </span>
+  );
 }
 
-// ─── Risk color helpers ───────────────────────────────────────────────────────
+// ─── Score card with expandable explainer ────────────────────────────────────
+function ScoreCard({ type, score, riskLevel }: {
+  type: keyof typeof SCORE_EXPLAINERS;
+  score: number;
+  riskLevel: RiskLevel;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const exp = SCORE_EXPLAINERS[type];
+  const action = exp.actionLevel(score);
+  const barColor = riskColor(riskLevel);
+  const pct = Math.min(100, (score / exp.maxScore) * 100);
+
+  return (
+    <Card className="overflow-hidden">
+      <CardContent className="p-0">
+        <div className="p-4">
+          <div className="flex items-start justify-between mb-2">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-lg">{exp.icon}</span>
+                <span className="font-bold text-foreground">{exp.name}</span>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button className="text-muted-foreground hover:text-foreground transition-colors">
+                      <HelpCircle className="w-3.5 h-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="max-w-xs">
+                    <p className="text-xs">{exp.whatIsIt}</p>
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5">{exp.fullName}</p>
+            </div>
+            <RiskBadge level={riskLevel} />
+          </div>
+          <div className="flex items-end gap-3 mb-3">
+            <span className="text-4xl font-black text-foreground leading-none">{score.toFixed(1)}</span>
+            <span className={`text-sm font-semibold pb-1 ${action.color}`}>{action.label}</span>
+          </div>
+          <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+            <div className="h-full rounded-full transition-all duration-700" style={{ width: `${pct}%`, backgroundColor: barColor }} />
+          </div>
+        </div>
+        <button
+          className="w-full px-4 py-2.5 flex items-center justify-between bg-slate-50 border-t hover:bg-slate-100 transition-colors text-xs font-medium text-muted-foreground"
+          onClick={() => setExpanded(!expanded)}
+        >
+          <span className="flex items-center gap-1.5">
+            <HelpCircle className="w-3.5 h-3.5" />
+            What does this score mean?
+          </span>
+          {expanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+        </button>
+        {expanded && (
+          <div className="px-4 pb-4 pt-3 bg-slate-50 space-y-3">
+            <p className="text-xs text-muted-foreground leading-relaxed">{exp.whatIsIt}</p>
+            <div className="space-y-1.5">
+              <p className="text-xs font-semibold text-foreground">Score scale:</p>
+              {exp.scale.map(s => (
+                <div key={s.range} className={`flex items-start gap-2 p-2 rounded-lg border text-xs ${s.bg}`}>
+                  <span className={`font-bold shrink-0 ${s.color}`}>{s.range}</span>
+                  <span className={`font-semibold shrink-0 ${s.color}`}>{s.label}:</span>
+                  <span className="text-foreground/80">{s.meaning}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── Video replay with skeleton overlay ──────────────────────────────────────
+function VideoReplay({ session }: { session: SessionRecord }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rafRef = useRef<number>(0);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+
+  const videoUrl = (session as any).videoUrl as string | undefined;
+  const snapshots = session.snapshots;
+
+  const nearestSnap = useCallback((t: number) => {
+    if (!snapshots.length) return null;
+    return snapshots.reduce((best, s) =>
+      Math.abs(s.timestamp / 1000 - t) < Math.abs(best.timestamp / 1000 - t) ? s : best
+    );
+  }, [snapshots]);
+
+  const drawFrame = useCallback(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const snap = nearestSnap(video.currentTime);
+    if (snap?.landmarks?.length) {
+      drawSkeleton({ landmarks: snap.landmarks, scores: { rula: snap.rula.score, reba: snap.reba.score }, canvas, videoWidth: canvas.width, videoHeight: canvas.height });
+    }
+    setCurrentTime(video.currentTime);
+    if (!video.paused && !video.ended) rafRef.current = requestAnimationFrame(drawFrame);
+  }, [nearestSnap]);
+
+  const togglePlay = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) { v.play(); setPlaying(true); rafRef.current = requestAnimationFrame(drawFrame); }
+    else { v.pause(); setPlaying(false); cancelAnimationFrame(rafRef.current); }
+  }, [drawFrame]);
+
+  const restart = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.pause(); v.currentTime = 0; setPlaying(false); cancelAnimationFrame(rafRef.current);
+    setTimeout(() => drawFrame(), 150);
+  }, [drawFrame]);
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const onMeta = () => { setDuration(v.duration); setTimeout(() => drawFrame(), 200); };
+    const onEnd = () => { setPlaying(false); cancelAnimationFrame(rafRef.current); };
+    v.addEventListener('loadedmetadata', onMeta);
+    v.addEventListener('ended', onEnd);
+    return () => { v.removeEventListener('loadedmetadata', onMeta); v.removeEventListener('ended', onEnd); cancelAnimationFrame(rafRef.current); };
+  }, [drawFrame]);
+
+  if (!videoUrl) {
+    return (
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm flex items-center gap-2"><Eye className="w-4 h-4 text-sky-500" />Video Replay</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="rounded-xl bg-slate-100 aspect-video flex flex-col items-center justify-center gap-3 text-muted-foreground">
+            <Eye className="w-10 h-10 opacity-30" />
+            <p className="text-sm">Video replay is available for video-upload sessions only.</p>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const pct = duration > 0 ? (currentTime / duration) * 100 : 0;
+  const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm flex items-center gap-2"><Eye className="w-4 h-4 text-sky-500" />Video Replay with Skeleton Overlay</CardTitle>
+        <p className="text-xs text-muted-foreground">The colored skeleton shows the AI's joint tracking. Green = safe, amber = caution, red = high risk.</p>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
+          <video ref={videoRef} src={videoUrl} className="absolute inset-0 w-full h-full object-contain opacity-0 pointer-events-none" muted preload="auto" playsInline />
+          <canvas ref={canvasRef} className="absolute inset-0 w-full h-full object-contain" />
+          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-4 py-3">
+            <div className="flex items-center gap-3">
+              <button onClick={togglePlay} className="w-8 h-8 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center transition-colors">
+                {playing ? <Pause className="w-4 h-4 text-white" /> : <Play className="w-4 h-4 text-white" />}
+              </button>
+              <button onClick={restart} className="w-7 h-7 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center transition-colors">
+                <RotateCcw className="w-3.5 h-3.5 text-white" />
+              </button>
+              <div className="flex-1 h-1.5 bg-white/20 rounded-full overflow-hidden cursor-pointer"
+                onClick={e => { const r = e.currentTarget.getBoundingClientRect(); if (videoRef.current) videoRef.current.currentTime = ((e.clientX - r.left) / r.width) * duration; }}>
+                <div className="h-full bg-sky-400 rounded-full" style={{ width: `${pct}%` }} />
+              </div>
+              <span className="text-white/80 text-xs font-mono shrink-0">{fmt(currentTime)} / {fmt(duration)}</span>
+            </div>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
+          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-green-500 inline-block" /> Safe posture</span>
+          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-amber-400 inline-block" /> Caution</span>
+          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-red-500 inline-block" /> High risk</span>
+          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-slate-300 inline-block" /> Low confidence</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── Before/After comparison ──────────────────────────────────────────────────
+function ComparisonPanel({ current, baseline }: { current: SessionRecord; baseline: SessionRecord }) {
+  const rows = [
+    { label: 'RULA', curr: current.avgRula, base: baseline.avgRula },
+    { label: 'REBA', curr: current.avgReba, base: baseline.avgReba },
+    { label: 'NIOSH LI', curr: current.avgNiosh, base: baseline.avgNiosh },
+    { label: 'RSI', curr: current.avgRsi, base: baseline.avgRsi },
+  ];
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm flex items-center gap-2"><GitCompare className="w-4 h-4 text-sky-500" />Before / After Comparison</CardTitle>
+        <p className="text-xs text-muted-foreground">Baseline: {baseline.id} — {baseline.taskName} ({baseline.date})</p>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-3">
+          {rows.map(row => {
+            const d = row.curr - row.base;
+            const pct = row.base > 0 ? ((d / row.base) * 100).toFixed(0) : '0';
+            const improved = d < 0;
+            return (
+              <div key={row.label} className="flex items-center gap-3">
+                <span className="text-xs font-medium w-16 shrink-0">{row.label}</span>
+                <div className="flex-1 grid grid-cols-2 gap-2 text-center">
+                  <div><p className="text-xs text-muted-foreground">Before</p><p className="text-lg font-bold">{row.base.toFixed(1)}</p></div>
+                  <div><p className="text-xs text-muted-foreground">After</p><p className="text-lg font-bold">{row.curr.toFixed(1)}</p></div>
+                </div>
+                <div className={`flex items-center gap-1 text-xs font-semibold w-20 justify-end ${improved ? 'text-green-600' : d === 0 ? 'text-slate-500' : 'text-red-600'}`}>
+                  {improved ? <TrendingDown className="w-3.5 h-3.5" /> : d === 0 ? <Minus className="w-3.5 h-3.5" /> : <TrendingUp className="w-3.5 h-3.5" />}
+                  {d === 0 ? 'No change' : `${improved ? '' : '+'}${pct}%`}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="mt-4 p-3 rounded-lg bg-slate-50 border">
+          <p className="text-xs font-medium">Overall Risk</p>
+          <div className="flex items-center gap-4 mt-1">
+            <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${riskBgClass(baseline.peakRisk)}`}>Before: {riskLabel(baseline.peakRisk)}</span>
+            <span>→</span>
+            <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${riskBgClass(current.peakRisk)}`}>After: {riskLabel(current.peakRisk)}</span>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── Corrective action row ────────────────────────────────────────────────────
 const PRIORITY_COLORS: Record<ActionPriority, string> = {
   critical: 'bg-red-100 text-red-800 border-red-200',
   high: 'bg-orange-100 text-orange-800 border-orange-200',
   medium: 'bg-amber-100 text-amber-800 border-amber-200',
   low: 'bg-slate-100 text-slate-700 border-slate-200',
 };
-
 const STATUS_COLORS: Record<ActionStatus, string> = {
   open: 'bg-slate-100 text-slate-700',
   'in-progress': 'bg-blue-100 text-blue-800',
@@ -62,60 +397,29 @@ const STATUS_COLORS: Record<ActionStatus, string> = {
   verified: 'bg-emerald-100 text-emerald-800',
 };
 
-const STATUS_ICONS: Record<ActionStatus, React.ReactNode> = {
-  open: <Circle className="w-3.5 h-3.5" />,
-  'in-progress': <AlertTriangle className="w-3.5 h-3.5" />,
-  completed: <CheckCircle2 className="w-3.5 h-3.5" />,
-  verified: <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />,
-};
-
-// ─── Corrective Action Row ────────────────────────────────────────────────────
-function ActionRow({
-  action,
-  onStatusChange,
-}: {
-  action: CorrectiveAction;
-  onStatusChange: (id: string, status: ActionStatus) => void;
-}) {
+function ActionRow({ action, onStatusChange }: { action: CorrectiveAction; onStatusChange: (id: string, s: ActionStatus) => void }) {
   const [expanded, setExpanded] = useState(false);
-
   return (
     <div className="border rounded-lg overflow-hidden">
-      <div
-        className="flex items-start gap-3 p-3 cursor-pointer hover:bg-slate-50 transition-colors"
-        onClick={() => setExpanded(v => !v)}
-      >
-        <div className="mt-0.5 shrink-0">
-          {STATUS_ICONS[action.status]}
-        </div>
+      <div className="flex items-start gap-3 p-3 cursor-pointer hover:bg-slate-50 transition-colors" onClick={() => setExpanded(v => !v)}>
+        <Circle className="w-3.5 h-3.5 mt-0.5 shrink-0 text-muted-foreground" />
         <div className="flex-1 min-w-0">
           <p className="text-sm text-foreground leading-snug">{action.description}</p>
           <div className="flex flex-wrap items-center gap-2 mt-1.5">
-            <span className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border font-medium ${PRIORITY_COLORS[action.priority]}`}>
-              {action.priority.charAt(0).toUpperCase() + action.priority.slice(1)}
-            </span>
-            <span className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium ${STATUS_COLORS[action.status]}`}>
-              {action.status.replace('-', ' ')}
-            </span>
+            <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${PRIORITY_COLORS[action.priority]}`}>{action.priority}</span>
+            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${STATUS_COLORS[action.status]}`}>{action.status.replace('-', ' ')}</span>
             <span className="text-xs text-muted-foreground capitalize">{action.category}</span>
-            {action.owner && <span className="text-xs text-muted-foreground">· {action.owner}</span>}
-            {action.dueDate && <span className="text-xs text-muted-foreground">· Due {action.dueDate}</span>}
           </div>
         </div>
-        <div className="shrink-0">
-          {expanded ? <ChevronUp className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
-        </div>
+        {expanded ? <ChevronUp className="w-4 h-4 text-muted-foreground shrink-0 mt-0.5" /> : <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0 mt-0.5" />}
       </div>
-
       {expanded && (
         <div className="px-3 pb-3 pt-0 border-t bg-slate-50 space-y-3">
           <p className="text-xs text-muted-foreground pt-2">Risk driver: {action.riskDriver}</p>
           <div className="flex items-center gap-2">
-            <span className="text-xs font-medium text-foreground">Update status:</span>
+            <span className="text-xs font-medium">Update status:</span>
             <Select value={action.status} onValueChange={v => onStatusChange(action.id, v as ActionStatus)}>
-              <SelectTrigger className="h-7 text-xs w-36">
-                <SelectValue />
-              </SelectTrigger>
+              <SelectTrigger className="h-7 text-xs w-36"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="open">Open</SelectItem>
                 <SelectItem value="in-progress">In Progress</SelectItem>
@@ -130,78 +434,11 @@ function ActionRow({
   );
 }
 
-// ─── Before/After Comparison ─────────────────────────────────────────────────
-function ComparisonPanel({ current, baseline }: { current: SessionRecord; baseline: SessionRecord }) {
-  const delta = (curr: number, base: number) => {
-    const d = curr - base;
-    const pct = base > 0 ? ((d / base) * 100).toFixed(0) : '0';
-    return { d, pct, improved: d < 0 };
-  };
-
-  const rows = [
-    { label: 'RULA', curr: current.avgRula, base: baseline.avgRula, max: 7 },
-    { label: 'REBA', curr: current.avgReba, base: baseline.avgReba, max: 15 },
-    { label: 'NIOSH LI', curr: current.avgNiosh, base: baseline.avgNiosh, max: 5 },
-    { label: 'RSI', curr: current.avgRsi, base: baseline.avgRsi, max: 100 },
-  ];
-
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <GitCompare className="w-4 h-4 text-sky-500" />
-          Before / After Comparison
-        </CardTitle>
-        <p className="text-xs text-muted-foreground">
-          Baseline: {baseline.id} — {baseline.taskName} ({baseline.date})
-        </p>
-      </CardHeader>
-      <CardContent>
-        <div className="space-y-3">
-          {rows.map(row => {
-            const { d, pct, improved } = delta(row.curr, row.base);
-            return (
-              <div key={row.label} className="flex items-center gap-3">
-                <span className="text-xs font-medium w-16 shrink-0">{row.label}</span>
-                <div className="flex-1 grid grid-cols-2 gap-2">
-                  <div className="text-center">
-                    <p className="text-xs text-muted-foreground">Before</p>
-                    <p className="text-lg font-bold text-foreground">{row.base.toFixed(1)}</p>
-                  </div>
-                  <div className="text-center">
-                    <p className="text-xs text-muted-foreground">After</p>
-                    <p className="text-lg font-bold text-foreground">{row.curr.toFixed(1)}</p>
-                  </div>
-                </div>
-                <div className={`flex items-center gap-1 text-xs font-semibold w-20 justify-end ${improved ? 'text-green-600' : d === 0 ? 'text-slate-500' : 'text-red-600'}`}>
-                  {improved ? <TrendingDown className="w-3.5 h-3.5" /> : d === 0 ? <Minus className="w-3.5 h-3.5" /> : <TrendingUp className="w-3.5 h-3.5" />}
-                  {d === 0 ? 'No change' : `${improved ? '' : '+'}${pct}%`}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        <div className="mt-4 p-3 rounded-lg bg-slate-50 border">
-          <p className="text-xs font-medium text-foreground">Overall Risk</p>
-          <div className="flex items-center gap-4 mt-1">
-            <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${riskBgClass(baseline.peakRisk)}`}>
-              Before: {riskLabel(baseline.peakRisk)}
-            </span>
-            <span>→</span>
-            <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${riskBgClass(current.peakRisk)}`}>
-              After: {riskLabel(current.peakRisk)}
-            </span>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-// ─── Main Component ───────────────────────────────────────────────────────────
+// ─── Main page ────────────────────────────────────────────────────────────────
 export default function SessionReport() {
   const { id } = useParams<{ id: string }>();
-  const { sessions, addSession } = useSession();
+  const [, navigate] = useLocation();
+  const { sessions } = useSession();
   const session = sessions.find(s => s.id === id);
   const [actions, setActions] = useState<CorrectiveAction[]>(session?.actions ?? []);
 
@@ -210,271 +447,234 @@ export default function SessionReport() {
     toast.success('Action status updated');
   }, []);
 
-  const handlePrint = useCallback(() => {
-    window.print();
-  }, []);
-
   if (!session) {
     return (
-      <div className="p-6 flex flex-col items-center justify-center min-h-64">
-        <p className="text-muted-foreground text-sm">Session not found.</p>
-        <Link href="/sessions">
-          <Button variant="ghost" size="sm" className="mt-3 gap-2">
-            <ArrowLeft className="w-4 h-4" /> Back to Sessions
-          </Button>
-        </Link>
+      <div className="p-8 flex flex-col items-center justify-center gap-4 text-center">
+        <AlertTriangle className="w-12 h-12 text-amber-400" />
+        <h2 className="text-xl font-bold">Session not found</h2>
+        <p className="text-sm text-muted-foreground max-w-sm">This session may have been deleted or the ID is incorrect.</p>
+        <Button variant="outline" onClick={() => navigate('/sessions')} className="gap-2">
+          <ArrowLeft className="w-4 h-4" /> Back to Sessions
+        </Button>
       </div>
     );
   }
 
-  // Build timeline data
+  // Timeline data
   const step = Math.max(1, Math.floor(session.snapshots.length / 60));
-  const timelineData = session.snapshots
-    .filter((_, i) => i % step === 0)
-    .map((snap, i) => ({
-      t: i,
-      rula: snap.rula.score,
-      reba: snap.reba.score,
-      overall: snap.overallScore,
-    }));
+  const chartData = session.snapshots.filter((_, i) => i % step === 0).map((s, i) => ({
+    t: `${Math.round(s.timestamp / 1000)}s`,
+    RULA: Math.round(s.rula.score * 10) / 10,
+    REBA: Math.round(s.reba.score * 10) / 10,
+    Overall: Math.round(s.overallScore * 10) / 10,
+  }));
 
-  // Body regions (use stored or compute)
-  const bodyRegions = session.bodyRegions?.length
-    ? session.bodyRegions
-    : buildBodyRegions(session.snapshots);
+  // Body regions
+  const bodyRegions = session.bodyRegions?.length ? session.bodyRegions : buildBodyRegions(session.snapshots);
+  const regionData = bodyRegions.map(r => ({ name: r.region, score: r.score, fill: riskColor(r.riskLevel) }));
 
   // Recommendations
-  const recommendations = session.recommendations?.length
-    ? session.recommendations
-    : generateRecommendations(session.snapshots, session.taskProfile);
+  const recommendations = session.recommendations?.length ? session.recommendations : generateRecommendations(session.snapshots, session.taskProfile);
 
-  // Baseline session for before/after
-  const baseline = session.baselineSessionId
-    ? sessions.find(s => s.id === session.baselineSessionId)
-    : null;
+  // Baseline session (for before/after)
+  const baselineSession = (session as any).baselineSessionId ? sessions.find(s => s.id === (session as any).baselineSessionId) : null;
 
-  // Angle averages
-  const avgAngles = session.snapshots.length > 0 ? {
-    neckFlexion: avg(session.snapshots.map(s => s.angles.neckFlexion)),
-    trunkFlexion: avg(session.snapshots.map(s => s.angles.trunkFlexion)),
-    leftUpperArm: avg(session.snapshots.map(s => s.angles.leftUpperArm)),
-    rightUpperArm: avg(session.snapshots.map(s => s.angles.rightUpperArm)),
-    leftWrist: avg(session.snapshots.map(s => s.angles.leftWrist)),
-    rightWrist: avg(session.snapshots.map(s => s.angles.rightWrist)),
-    hipFlexion: avg(session.snapshots.map(s => s.angles.hipFlexion)),
-  } : null;
+  // Summary verdict
+  const isHighRisk = session.peakRisk === 'high' || session.peakRisk === 'very-high';
+  const isMedRisk = session.peakRisk === 'medium';
+  const summaryText = isHighRisk
+    ? "This assessment found serious ergonomic risks that require immediate attention. The worker's posture during this task puts them at significant risk of a musculoskeletal injury — the kind that can cause chronic pain, lost work time, or a workers' compensation claim. The scores below are not just numbers; they represent real injury risk that can be reduced with the right changes."
+    : isMedRisk
+    ? "This assessment found moderate ergonomic risks. The worker's posture is not immediately dangerous, but continued exposure without changes will likely lead to discomfort or injury over time. The recommendations below outline practical steps to reduce this risk."
+    : "This assessment found low ergonomic risk. The worker's posture during this task is generally acceptable. Minor improvements may still be beneficial for long-term comfort, but no urgent action is required.";
 
-  const openActions = actions.filter(a => a.status === 'open' || a.status === 'in-progress').length;
-  const completedActions = actions.filter(a => a.status === 'completed' || a.status === 'verified').length;
+  const openActions = actions.filter(a => a.status === 'open' || a.status === 'in-progress');
+  const doneActions = actions.filter(a => a.status === 'completed' || a.status === 'verified');
+
+  // Score risk levels
+  const rulaRisk: RiskLevel = session.avgRula >= 7 ? 'very-high' : session.avgRula >= 5 ? 'high' : session.avgRula >= 3 ? 'medium' : 'low';
+  const rebaRisk: RiskLevel = session.avgReba >= 11 ? 'very-high' : session.avgReba >= 8 ? 'high' : session.avgReba >= 4 ? 'medium' : session.avgReba >= 2 ? 'low' : 'negligible';
+  const nioshRisk: RiskLevel = session.avgNiosh >= 2 ? 'high' : session.avgNiosh >= 1 ? 'medium' : 'low';
+  const rsiRisk: RiskLevel = session.avgRsi >= 40 ? 'high' : session.avgRsi >= 20 ? 'medium' : 'low';
 
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-6 print:p-4 print:space-y-4">
+    <div className="p-4 md:p-6 max-w-5xl mx-auto space-y-6 print:p-4">
       {/* Header */}
       <div className="flex items-start justify-between gap-4 print:hidden">
         <div className="flex items-center gap-3">
-          <Link href="/sessions">
-            <Button variant="ghost" size="sm" className="gap-2 -ml-2">
-              <ArrowLeft className="w-4 h-4" /> Sessions
-            </Button>
-          </Link>
+          <Button variant="ghost" size="icon" onClick={() => navigate('/sessions')} className="shrink-0">
+            <ArrowLeft className="w-4 h-4" />
+          </Button>
+          <div>
+            <h1 className="text-xl font-bold">{session.taskName}</h1>
+            <div className="flex flex-wrap items-center gap-2 mt-1 text-sm text-muted-foreground">
+              <span>{session.id}</span>
+              <span>·</span><span>{session.date}</span>
+              {session.assessor && <><span>·</span><span>{session.assessor}</span></>}
+              {session.department && <><span>·</span><span>{session.department}</span></>}
+            </div>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" className="gap-2" onClick={handlePrint}>
-            <Printer className="w-4 h-4" /> Print / Export PDF
+        <div className="flex items-center gap-2 shrink-0">
+          <RiskBadge level={session.peakRisk} />
+          <Badge variant="outline" className="text-xs">{session.source === 'video-upload' ? '📹 Video Upload' : '📷 Live Scan'}</Badge>
+          <Button variant="outline" size="sm" onClick={() => window.print()} className="gap-1.5">
+            <Printer className="w-3.5 h-3.5" /> Print
           </Button>
         </div>
       </div>
 
-      {/* Title block */}
-      <div className="flex items-start gap-4">
-        {session.thumbnailDataUrl ? (
-          <img
-            src={session.thumbnailDataUrl}
-            alt="Assessment frame"
-            className="w-20 h-14 object-cover rounded-lg border shrink-0"
-          />
-        ) : (
-          <div className="w-20 h-14 rounded-lg border bg-slate-100 flex items-center justify-center shrink-0">
-            {session.source === 'video-upload'
-              ? <FileVideo className="w-6 h-6 text-slate-400" />
-              : <Camera className="w-6 h-6 text-slate-400" />}
+      {/* Print header */}
+      <div className="hidden print:block mb-4">
+        <h1 className="text-2xl font-bold">ErgoKit Assessment Report</h1>
+        <p className="text-sm text-muted-foreground">{session.taskName} · {session.id} · {session.date}</p>
+      </div>
+
+      {/* Plain-English Summary */}
+      <Card className={`border-l-4 ${isHighRisk ? 'border-l-red-500 bg-red-50/40' : isMedRisk ? 'border-l-amber-500 bg-amber-50/40' : 'border-l-green-500 bg-green-50/40'}`}>
+        <CardContent className="p-5">
+          <div className="flex items-start gap-3">
+            <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${isHighRisk ? 'bg-red-100' : isMedRisk ? 'bg-amber-100' : 'bg-green-100'}`}>
+              {isHighRisk ? <AlertTriangle className="w-5 h-5 text-red-600" /> : isMedRisk ? <Activity className="w-5 h-5 text-amber-600" /> : <CheckCircle2 className="w-5 h-5 text-green-600" />}
+            </div>
+            <div className="flex-1">
+              <h2 className="font-bold text-foreground mb-1">
+                {isHighRisk ? 'Action Required — High Ergonomic Risk Detected' : isMedRisk ? 'Moderate Risk — Changes Recommended' : 'Low Risk — Acceptable Posture'}
+              </h2>
+              <p className="text-sm text-foreground/80 leading-relaxed">{summaryText}</p>
+              <div className="flex flex-wrap gap-3 mt-3 text-xs text-muted-foreground">
+                <span>⏱ Duration: <strong className="text-foreground">{session.duration}s</strong></span>
+                <span>📊 Frames: <strong className="text-foreground">{session.snapshots.length}</strong></span>
+                <span>⚠️ Open actions: <strong className={openActions.length > 0 ? 'text-red-600' : 'text-green-600'}>{openActions.length}</strong></span>
+                {session.location && <span>📍 <strong className="text-foreground">{session.location}</strong></span>}
+              </div>
+            </div>
           </div>
-        )}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <h1 className="text-xl font-bold text-foreground">{session.taskName}</h1>
-            <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${riskBgClass(session.peakRisk)}`}>
-              {riskLabel(session.peakRisk)} Risk
-            </span>
-            <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 font-medium">
-              {session.source === 'video-upload' ? 'Video Upload' : 'Live Scan'}
-            </span>
-          </div>
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-1.5 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1"><ClipboardList className="w-3.5 h-3.5" />{session.id}</span>
-            <span className="flex items-center gap-1"><Calendar className="w-3.5 h-3.5" />{session.date}</span>
-            <span className="flex items-center gap-1"><Clock className="w-3.5 h-3.5" />{formatDuration(session.duration)}</span>
-            {session.assessor && <span className="flex items-center gap-1"><User className="w-3.5 h-3.5" />{session.assessor}</span>}
-            {session.department && <span className="flex items-center gap-1"><Building2 className="w-3.5 h-3.5" />{session.department}</span>}
-            {session.location && <span className="flex items-center gap-1"><MapPin className="w-3.5 h-3.5" />{session.location}</span>}
-          </div>
-          {session.notes && (
-            <p className="text-xs text-muted-foreground mt-1 italic">"{session.notes}"</p>
-          )}
+        </CardContent>
+      </Card>
+
+      {/* Score Cards */}
+      <div>
+        <h2 className="text-base font-bold mb-3 flex items-center gap-2">
+          <Zap className="w-4 h-4 text-sky-500" />
+          Assessment Scores
+          <span className="text-xs font-normal text-muted-foreground ml-1">Click "What does this score mean?" on any card to learn more</span>
+        </h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <ScoreCard type="rula" score={session.avgRula} riskLevel={rulaRisk} />
+          <ScoreCard type="reba" score={session.avgReba} riskLevel={rebaRisk} />
+          <ScoreCard type="niosh" score={session.avgNiosh} riskLevel={nioshRisk} />
+          <ScoreCard type="rsi" score={session.avgRsi} riskLevel={rsiRisk} />
         </div>
       </div>
 
-      {/* Score Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        {[
-          { label: 'RULA', value: session.avgRula, max: 7, result: session.snapshots[0]?.rula },
-          { label: 'REBA', value: session.avgReba, max: 15, result: session.snapshots[0]?.reba },
-          { label: 'NIOSH LI', value: session.avgNiosh, max: 5, result: session.snapshots[0]?.niosh },
-          { label: 'RSI', value: session.avgRsi, max: 100, result: session.snapshots[0]?.rsi },
-        ].map(({ label, value, max, result }) => {
-          const pct = Math.min(100, (value / max) * 100);
-          const rl = result?.riskLevel ?? 'low';
-          return (
-            <Card key={label} className="overflow-hidden">
-              <CardContent className="p-4">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">{label}</span>
-                  <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${riskBgClass(rl)}`}>
-                    {riskLabel(rl)}
-                  </span>
-                </div>
-                <p className="text-3xl font-bold text-foreground">{value.toFixed(1)}</p>
-                <div className="mt-2 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                  <div
-                    className="h-full rounded-full transition-all"
-                    style={{ width: `${pct}%`, backgroundColor: riskColor(rl) }}
-                  />
-                </div>
-                {result?.interpretation && (
-                  <p className="text-xs text-muted-foreground mt-2 leading-snug">{result.interpretation}</p>
-                )}
-              </CardContent>
-            </Card>
-          );
-        })}
-      </div>
+      {/* Video Replay */}
+      <VideoReplay session={session} />
 
-      {/* Timeline Chart */}
-      {timelineData.length > 1 && (
+      {/* Body Region Risk Map */}
+      {regionData.length > 0 && (
         <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Risk Score Timeline</CardTitle>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm flex items-center gap-2"><Shield className="w-4 h-4 text-sky-500" />Body Region Risk Map</CardTitle>
+            <p className="text-xs text-muted-foreground">Which parts of the body are under the most stress? Red bars indicate areas that need attention.</p>
           </CardHeader>
           <CardContent>
-            <ResponsiveContainer width="100%" height={200}>
-              <LineChart data={timelineData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="oklch(0.92 0.004 286.32)" />
-                <XAxis dataKey="t" tick={{ fontSize: 10 }} tickFormatter={v => `${v}s`} />
-                <YAxis tick={{ fontSize: 10 }} domain={[0, 15]} />
-                <Tooltip
-                  contentStyle={{ fontSize: 11, borderRadius: 8 }}
-                  formatter={(v: number, name: string) => [v.toFixed(1), name.toUpperCase()]}
-                />
-                <Legend iconType="line" wrapperStyle={{ fontSize: 11 }} />
-                <ReferenceLine y={5} stroke="#D97706" strokeDasharray="4 2" label={{ value: 'RULA Action', fontSize: 9, fill: '#D97706' }} />
-                <ReferenceLine y={8} stroke="#DC2626" strokeDasharray="4 2" label={{ value: 'REBA High', fontSize: 9, fill: '#DC2626' }} />
-                <Line type="monotone" dataKey="rula" stroke="#3B82F6" dot={false} strokeWidth={2} name="RULA" />
-                <Line type="monotone" dataKey="reba" stroke="#F59E0B" dot={false} strokeWidth={2} name="REBA" />
-                <Line type="monotone" dataKey="overall" stroke="#8B5CF6" dot={false} strokeWidth={1.5} strokeDasharray="4 2" name="Overall" />
+            <ResponsiveContainer width="100%" height={Math.max(200, regionData.length * 32)}>
+              <BarChart data={regionData} layout="vertical" margin={{ left: 20, right: 40 }}>
+                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                <XAxis type="number" domain={[0, 10]} tick={{ fontSize: 11 }} />
+                <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} width={110} />
+                <ReTooltip formatter={(v: number) => [v.toFixed(1), 'Risk Score']} contentStyle={{ fontSize: 12 }} />
+                <Bar dataKey="score" radius={[0, 4, 4, 0]}>
+                  {regionData.map((e, i) => <Cell key={i} fill={e.fill} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Average Joint Angles */}
+      {session.avgAngles && Object.keys(session.avgAngles).length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm flex items-center gap-2"><Activity className="w-4 h-4 text-sky-500" />Average Joint Angles</CardTitle>
+            <p className="text-xs text-muted-foreground">How far each joint moved from its neutral (safe) position on average. Red values are outside the safe range.</p>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-3">
+              {Object.entries(session.avgAngles).map(([key, value]) => {
+                const info = ANGLE_SAFE_RANGES[key];
+                if (!info) return null;
+                const risk = getAngleRisk(key, value);
+                const color = angleColor(risk);
+                const [lo, hi] = info.safe;
+                const maxRange = Math.max(Math.abs(lo), Math.abs(hi)) * 2.5;
+                const pct = Math.min(100, (Math.abs(value) / maxRange) * 100);
+                return (
+                  <div key={key} className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-medium">{info.label}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-muted-foreground text-[10px]">Safe: {lo}° to {hi}°</span>
+                        <span className="font-bold" style={{ color }}>{value.toFixed(1)}°</span>
+                        {risk !== 'safe' && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ backgroundColor: color + '20', color }}>
+                            {risk === 'danger' ? '⚠ Outside safe range' : '~ Near limit'}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+                      <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: color }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Risk Score Timeline */}
+      {chartData.length > 1 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm flex items-center gap-2"><TrendingUp className="w-4 h-4 text-sky-500" />Risk Score Timeline</CardTitle>
+            <p className="text-xs text-muted-foreground">How risk scores changed over the task duration. Spikes indicate moments of particularly risky posture.</p>
+          </CardHeader>
+          <CardContent>
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={chartData} margin={{ left: 0, right: 10 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                <XAxis dataKey="t" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
+                <YAxis domain={[0, 15]} tick={{ fontSize: 10 }} />
+                <ReTooltip contentStyle={{ fontSize: 12 }} />
+                <ReferenceLine y={7} stroke="#ef4444" strokeDasharray="4 2" label={{ value: 'RULA High', fontSize: 10, fill: '#ef4444' }} />
+                <ReferenceLine y={8} stroke="#f97316" strokeDasharray="4 2" label={{ value: 'REBA High', fontSize: 10, fill: '#f97316' }} />
+                <ReferenceLine y={5} stroke="#f59e0b" strokeDasharray="4 2" label={{ value: 'RULA Action', fontSize: 10, fill: '#f59e0b' }} />
+                <Line type="monotone" dataKey="RULA" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="REBA" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="Overall" stroke="#8b5cf6" strokeWidth={1.5} dot={false} strokeDasharray="4 2" />
               </LineChart>
             </ResponsiveContainer>
           </CardContent>
         </Card>
       )}
 
-      {/* Body Region Risk Heat Map + Angle Table */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Heat Map */}
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Body Region Risk Map</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={280}>
-              <BarChart
-                data={bodyRegions}
-                layout="vertical"
-                margin={{ top: 0, right: 10, left: 60, bottom: 0 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="oklch(0.92 0.004 286.32)" />
-                <XAxis type="number" domain={[0, 10]} tick={{ fontSize: 10 }} />
-                <YAxis type="category" dataKey="region" tick={{ fontSize: 11 }} width={60} />
-                <Tooltip
-                  contentStyle={{ fontSize: 11, borderRadius: 8 }}
-                  formatter={(v: number) => [v.toFixed(1), 'Risk Score']}
-                />
-                <Bar dataKey="score" radius={[0, 4, 4, 0]}>
-                  {bodyRegions.map((entry, i) => (
-                    <Cell key={i} fill={riskColor(entry.riskLevel)} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        {/* Angle Table */}
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Average Joint Angles</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {avgAngles ? (
-              <div className="space-y-2">
-                {[
-                  { label: 'Neck Flexion', value: avgAngles.neckFlexion, threshold: 20, unit: '°' },
-                  { label: 'Trunk Flexion', value: avgAngles.trunkFlexion, threshold: 20, unit: '°' },
-                  { label: 'L. Shoulder Elevation', value: avgAngles.leftUpperArm, threshold: 45, unit: '°' },
-                  { label: 'R. Shoulder Elevation', value: avgAngles.rightUpperArm, threshold: 45, unit: '°' },
-                  { label: 'L. Wrist Deviation', value: avgAngles.leftWrist, threshold: 15, unit: '°' },
-                  { label: 'R. Wrist Deviation', value: avgAngles.rightWrist, threshold: 15, unit: '°' },
-                  { label: 'Hip Flexion', value: avgAngles.hipFlexion, threshold: 60, unit: '°' },
-                ].map(row => (
-                  <div key={row.label} className="flex items-center gap-2">
-                    <span className="text-xs text-muted-foreground w-40 shrink-0">{row.label}</span>
-                    <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                      <div
-                        className="h-full rounded-full"
-                        style={{
-                          width: `${Math.min(100, (row.value / 90) * 100)}%`,
-                          backgroundColor: row.value > row.threshold ? '#DC2626' : '#22C55E',
-                        }}
-                      />
-                    </div>
-                    <span className={`text-xs font-semibold w-12 text-right ${row.value > row.threshold ? 'text-red-600' : 'text-green-600'}`}>
-                      {row.value.toFixed(1)}{row.unit}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">No angle data available.</p>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Recommendations */}
+      {/* AI Recommendations */}
       {recommendations.length > 0 && (
         <Card>
           <CardHeader className="pb-3">
-            <CardTitle className="text-sm flex items-center gap-2">
-              <Lightbulb className="w-4 h-4 text-amber-500" />
-              AI-Generated Recommendations
-            </CardTitle>
-            <p className="text-xs text-muted-foreground">Plain-language guidance based on detected posture and task parameters</p>
+            <CardTitle className="text-sm flex items-center gap-2"><Zap className="w-4 h-4 text-amber-500" />Recommendations</CardTitle>
+            <p className="text-xs text-muted-foreground">Plain-language guidance based on what the AI detected. These are practical steps to reduce the risk.</p>
           </CardHeader>
           <CardContent>
-            <div className="space-y-2">
+            <div className="space-y-2.5">
               {recommendations.map((rec, i) => (
                 <div key={i} className="flex items-start gap-3 p-3 bg-amber-50 border border-amber-100 rounded-lg">
-                  <span className="text-xs font-bold text-amber-600 shrink-0 mt-0.5">{i + 1}</span>
-                  <p className="text-sm text-foreground leading-relaxed">{rec}</p>
+                  <span className="w-6 h-6 rounded-full bg-amber-200 text-amber-800 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">{i + 1}</span>
+                  <p className="text-sm text-foreground/90 leading-relaxed">{rec}</p>
                 </div>
               ))}
             </div>
@@ -483,44 +683,42 @@ export default function SessionReport() {
       )}
 
       {/* Corrective Actions */}
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center justify-between">
-            <CardTitle className="text-sm flex items-center gap-2">
-              <Wrench className="w-4 h-4 text-sky-500" />
-              Corrective Actions
-            </CardTitle>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span className="px-2 py-0.5 rounded-full bg-red-50 text-red-700 font-medium">{openActions} open</span>
-              <span className="px-2 py-0.5 rounded-full bg-green-50 text-green-700 font-medium">{completedActions} done</span>
+      {actions.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-sm flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-sky-500" />Corrective Actions</CardTitle>
+              <div className="flex gap-2 text-xs">
+                {openActions.length > 0 && <span className="px-2 py-0.5 bg-red-100 text-red-700 rounded-full font-medium">{openActions.length} open</span>}
+                {doneActions.length > 0 && <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded-full font-medium">{doneActions.length} done</span>}
+              </div>
             </div>
-          </div>
-          <p className="text-xs text-muted-foreground">Auto-generated from risk analysis. Click any action to update its status.</p>
-        </CardHeader>
-        <CardContent>
-          {actions.length > 0 ? (
+            <p className="text-xs text-muted-foreground">Auto-generated action items based on the risk analysis. Track progress as each item is addressed.</p>
+          </CardHeader>
+          <CardContent>
             <div className="space-y-2">
-              {actions.map(action => (
-                <ActionRow key={action.id} action={action} onStatusChange={handleStatusChange} />
-              ))}
+              {actions.map(action => <ActionRow key={action.id} action={action} onStatusChange={handleStatusChange} />)}
             </div>
-          ) : (
-            <p className="text-sm text-muted-foreground text-center py-6">No corrective actions generated.</p>
-          )}
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+      )}
 
-      {/* Before/After Comparison */}
-      {baseline && <ComparisonPanel current={session} baseline={baseline} />}
+      {/* Before/After */}
+      {baselineSession && <ComparisonPanel current={session} baseline={baselineSession} />}
 
-      {/* Print styles */}
-      <style>{`
-        @media print {
-          .print\\:hidden { display: none !important; }
-          .print\\:p-4 { padding: 1rem !important; }
-          .print\\:space-y-4 > * + * { margin-top: 1rem !important; }
-        }
-      `}</style>
+      {/* Notes */}
+      {session.notes && (
+        <Card>
+          <CardHeader className="pb-2"><CardTitle className="text-sm">Assessor Notes</CardTitle></CardHeader>
+          <CardContent><p className="text-sm text-muted-foreground leading-relaxed">{session.notes}</p></CardContent>
+        </Card>
+      )}
+
+      {/* Print footer */}
+      <div className="hidden print:block text-xs text-muted-foreground border-t pt-4 mt-6">
+        <p>Generated by ErgoKit CV Ergonomics · {new Date().toLocaleString()} · Session {session.id}</p>
+        <p className="mt-1">This report is generated automatically by computer vision analysis. Results should be reviewed by a qualified ergonomist for critical decisions.</p>
+      </div>
     </div>
   );
 }

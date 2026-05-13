@@ -16,7 +16,7 @@
  *   - 65% visibility confidence gating
  *   - Torso-normalized 3D angle math
  */
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 import { useLocation } from 'wouter';
 import {
   Upload, Film, Play, CheckCircle2, AlertCircle,
@@ -36,6 +36,7 @@ import {
   riskBgClass, riskLabel, riskColor,
   summarizeSession, buildBodyRegions, generateRecommendations, generateActions,
 } from '@/lib/ergo-engine';
+import { drawSkeleton } from '@/lib/skeleton-overlay';
 import type { TaskProfile, ErgoSnapshot, SessionSource } from '@/lib/ergo-engine';
 
 // MediaPipe CDN
@@ -72,6 +73,10 @@ export default function VideoUpload() {
   const [location, setLocation] = useState('');
   const [notes, setNotes] = useState('');
   const [baselineId, setBaselineId] = useState('');
+
+  // Live overlay state
+  const [liveScores, setLiveScores] = useState<{ rula: number; reba: number } | null>(null);
+  const [liveLandmarks, setLiveLandmarks] = useState<any[]>([]);
 
   // Refs for analysis
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -191,8 +196,31 @@ export default function VideoUpload() {
       if (result?.landmarks?.length > 0) {
         const raw = result.landmarks[0];
         const smoothed = emaRef.current.smooth(raw);
-        const snap = computeSnapshot(smoothed, taskProfileRef.current);
-        if (snap) snapshots.push({ ...snap, timestamp: t * 1000 });
+          const snap = computeSnapshot(smoothed, taskProfileRef.current);
+          if (snap) {
+            snapshots.push({ ...snap, timestamp: t * 1000, landmarks: smoothed });
+          // Draw skeleton overlay on canvas in real time
+          const scores = {
+            rula: snap.rula.score,
+            reba: snap.reba.score,
+          };
+          setLiveScores(scores);
+          setLiveLandmarks(smoothed);
+          if (canvas) {
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            }
+            drawSkeleton({
+              landmarks: smoothed,
+              scores,
+              canvas,
+              videoWidth: canvas.width,
+              videoHeight: canvas.height,
+            });
+          }
+        }
       }
 
       setFramesProcessed(i + 1);
@@ -221,6 +249,8 @@ export default function VideoUpload() {
     );
 
     if (baselineId) (record as any).baselineSessionId = baselineId;
+    // Store the object URL so the session report can replay the video with overlay
+    (record as any).videoUrl = videoUrl;
 
     addSession(record);
     setResultId(record.id);
@@ -301,27 +331,28 @@ export default function VideoUpload() {
                   controls={!isAnalyzing}
                   preload="metadata"
                 />
-                {/* Skeleton canvas overlay */}
+                {/* Skeleton canvas overlay — shows video frame + skeleton during analysis */}
                 <canvas
                   ref={canvasRef}
                   className="absolute inset-0 w-full h-full pointer-events-none"
                   style={{ display: analysisState === 'analyzing' ? 'block' : 'none' }}
                 />
-                {/* Analysis overlay */}
+                {/* Progress HUD — semi-transparent strip at bottom only, so skeleton is visible */}
                 {isAnalyzing && (
-                  <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center gap-4">
-                    <div className="text-white text-center">
-                      <p className="text-sm font-medium mb-1">
-                        {analysisState === 'loading-model' ? 'Loading AI model…' : 'Analyzing posture…'}
-                      </p>
-                      <p className="text-xs text-white/60">
-                        {analysisState === 'analyzing' ? `Frame ${framesProcessed} / ${totalFrames}` : 'Please wait'}
-                      </p>
+                  <div className="absolute bottom-0 left-0 right-0 bg-black/70 px-4 py-3 flex items-center gap-4">
+                    <div className="flex-1">
+                      <div className="flex justify-between text-xs text-white/80 mb-1">
+                        <span>{analysisState === 'loading-model' ? 'Loading AI model…' : `Analyzing frame ${framesProcessed} / ${totalFrames}`}</span>
+                        <span>{progress}%</span>
+                      </div>
+                      <Progress value={progress} className="h-1.5" />
                     </div>
-                    <div className="w-64">
-                      <Progress value={progress} className="h-2" />
-                    </div>
-                    <p className="text-white/60 text-xs">{progress}% complete</p>
+                    {liveScores && (
+                      <div className="flex gap-3 text-xs font-mono shrink-0">
+                        <span className="text-white/60">RULA <span className={`font-bold ${liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.rula.toFixed(1)}</span></span>
+                        <span className="text-white/60">REBA <span className={`font-bold ${liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.reba.toFixed(1)}</span></span>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

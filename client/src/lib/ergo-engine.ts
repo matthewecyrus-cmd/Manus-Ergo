@@ -62,6 +62,8 @@ export interface ErgoSnapshot {
   angles: BodyAngles;
   overallRisk: RiskLevel;
   overallScore: number;
+  /** Raw smoothed landmarks — stored for video replay overlay */
+  landmarks?: Landmark[];
 }
 
 export interface BodyAngles {
@@ -703,6 +705,10 @@ export interface SessionRecord {
   baselineSessionId?: string;
   /** Thumbnail data URL from a key frame */
   thumbnailDataUrl?: string;
+  /** Object URL of the original video file — for replay with skeleton overlay */
+  videoUrl?: string;
+  /** Average joint angles across all snapshots */
+  avgAngles?: Record<string, number>;
 }
 
 // ─── BODY REGION RISK BUILDER ────────────────────────────────────────────────
@@ -831,5 +837,16 @@ export function summarizeSession(
     actions: generateActions(snapshots, task),
     bodyRegions: buildBodyRegions(snapshots),
     recommendations: generateRecommendations(snapshots, task),
+    avgAngles: snapshots.length ? {
+      neckFlexion: Math.round(avg(s => s.angles.neckFlexion) * 10) / 10,
+      trunkFlexion: Math.round(avg(s => s.angles.trunkFlexion) * 10) / 10,
+      leftUpperArm: Math.round(avg(s => s.angles.leftUpperArm) * 10) / 10,
+      rightUpperArm: Math.round(avg(s => s.angles.rightUpperArm) * 10) / 10,
+      leftWrist: Math.round(avg(s => s.angles.leftWrist) * 10) / 10,
+      rightWrist: Math.round(avg(s => s.angles.rightWrist) * 10) / 10,
+      hipFlexion: Math.round(avg(s => s.angles.hipFlexion) * 10) / 10,
+      leftKnee: Math.round(avg(s => s.angles.leftKnee) * 10) / 10,
+      rightKnee: Math.round(avg(s => s.angles.rightKnee) * 10) / 10,
+    } : undefined,
   };
 }
