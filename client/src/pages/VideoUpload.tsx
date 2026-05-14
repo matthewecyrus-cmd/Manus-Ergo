@@ -3,24 +3,21 @@
  * =====================
  * Design: Clinical Dashboard — deep navy sidebar, sky-blue accents, ISO risk colors
  *
- * Workflow:
- *   1. User drags-and-drops or selects a video file (mp4, mov, webm, avi)
- *   2. Task metadata is configured (task name, load, rep rate, etc.)
- *   3. "Analyze Video" triggers frame-by-frame MediaPipe BlazePose analysis
- *   4. Progress bar shows frame count; skeleton overlay drawn on a hidden canvas
- *   5. On completion, session is saved with full snapshots, body regions, actions, recommendations
- *   6. User is navigated to the session report
- *
- * Signal processing (same as live scan):
- *   - EMA jitter filter (alpha=0.25)
- *   - 65% visibility confidence gating
- *   - Torso-normalized 3D angle math
+ * Key fixes in this version:
+ *   1. MediaPipe uses IMAGE mode (detect) for frame-by-frame analysis, not VIDEO mode.
+ *      VIDEO mode requires a continuously playing video stream; IMAGE mode works on
+ *      seeked frames. Confidence thresholds lowered to 0.3 for side-angle shots.
+ *   2. Canvas is sized to the VIDEO ELEMENT's displayed pixel dimensions (getBoundingClientRect),
+ *      NOT the natural video resolution. Landmark coordinates (0-1 normalized) are then
+ *      multiplied by the displayed size, so joints map correctly onto the visible person.
+ *   3. Analyze button is pinned at the TOP of the right column, always visible above the fold.
+ *   4. Configuration panel is collapsible to keep the UI compact.
  */
-import { useRef, useState, useCallback, useEffect } from 'react';
+import { useRef, useState, useCallback, useEffect, useContext } from 'react';
 import { useLocation } from 'wouter';
 import {
   Upload, Film, Play, CheckCircle2, AlertCircle,
-  Settings2, ChevronRight, X, FileVideo
+  Settings2, ChevronRight, X, FileVideo, ChevronDown, ChevronUp
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -30,24 +27,111 @@ import { Label } from '@/components/ui/label';
 import { Slider } from '@/components/ui/slider';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from 'sonner';
-import { useSession } from '@/contexts/SessionContext';
+import { useSession, SessionContext } from '@/contexts/SessionContext';
 import {
   EMAFilter, computeSnapshot, DEFAULT_TASK_PROFILE,
-  riskBgClass, riskLabel, riskColor,
-  summarizeSession, buildBodyRegions, generateRecommendations, generateActions,
+  riskLabel,
+  summarizeSession,
 } from '@/lib/ergo-engine';
-import { drawSkeleton } from '@/lib/skeleton-overlay';
-import type { TaskProfile, ErgoSnapshot, SessionSource } from '@/lib/ergo-engine';
+import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord } from '@/lib/ergo-engine';
 
 // MediaPipe CDN
 const MEDIAPIPE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
-const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+// Use the full model for better side-angle detection
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
 
 type AnalysisState = 'idle' | 'loading-model' | 'analyzing' | 'done' | 'error';
 
-function formatDuration(s: number) {
-  if (s < 60) return `${s}s`;
-  return `${Math.floor(s / 60)}m ${s % 60}s`;
+// ─── Skeleton drawing (inline, sized to displayed element) ────────────────────
+const POSE_CONNECTIONS: [number, number][] = [
+  [11, 12], [11, 23], [12, 24], [23, 24],
+  [11, 13], [13, 15],
+  [12, 14], [14, 16],
+  [23, 25], [25, 27],
+  [24, 26], [26, 28],
+  [15, 17], [15, 19], [17, 19],
+  [16, 18], [16, 20], [18, 20],
+  [0, 11], [0, 12],
+];
+
+const RISK_COLORS: Record<string, string> = {
+  low: '#22c55e',
+  medium: '#f59e0b',
+  high: '#ef4444',
+  'very-high': '#dc2626',
+};
+
+function drawSkeletonOnCanvas(
+  canvas: HTMLCanvasElement,
+  lm: any[],
+  scores: { rula: number; reba: number } | null,
+  displayW: number,
+  displayH: number,
+) {
+  canvas.width = displayW;
+  canvas.height = displayH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.clearRect(0, 0, displayW, displayH);
+
+  const CONF = 0.3; // lowered threshold for side-angle shots
+
+  const riskLevel = scores
+    ? scores.rula >= 7 || scores.reba >= 11 ? 'very-high'
+      : scores.rula >= 5 || scores.reba >= 8 ? 'high'
+      : scores.rula >= 3 || scores.reba >= 4 ? 'medium'
+      : 'low'
+    : 'low';
+  const boneColor = RISK_COLORS[riskLevel] ?? '#22d3ee';
+
+  // Draw bones
+  ctx.lineWidth = Math.max(2, displayW / 320);
+  for (const [a, b] of POSE_CONNECTIONS) {
+    const la = lm[a], lb = lm[b];
+    if (!la || !lb) continue;
+    if ((la.visibility ?? 1) < CONF || (lb.visibility ?? 1) < CONF) continue;
+    ctx.beginPath();
+    ctx.moveTo(la.x * displayW, la.y * displayH);
+    ctx.lineTo(lb.x * displayW, lb.y * displayH);
+    ctx.strokeStyle = boneColor + 'cc';
+    ctx.stroke();
+  }
+
+  // Draw joints
+  const r = Math.max(4, displayW / 160);
+  for (let i = 0; i < lm.length; i++) {
+    const pt = lm[i];
+    if (!pt || (pt.visibility ?? 1) < CONF) continue;
+    const x = pt.x * displayW;
+    const y = pt.y * displayH;
+
+    // Glow ring
+    ctx.beginPath();
+    ctx.arc(x, y, r * 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = boneColor + '33';
+    ctx.fill();
+
+    // Solid dot
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = boneColor;
+    ctx.fill();
+  }
+
+  // Score badge top-left
+  if (scores) {
+    const badgeW = 110;
+    const badgeH = 36;
+    const pad = 8;
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.beginPath();
+    ctx.roundRect(pad, pad, badgeW, badgeH, 6);
+    ctx.fill();
+    ctx.font = `bold ${Math.max(11, displayW / 60)}px monospace`;
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'left';
+    ctx.fillText(`RULA ${scores.rula.toFixed(0)}  REBA ${scores.reba.toFixed(0)}`, pad + 8, pad + 23);
+  }
 }
 
 export default function VideoUpload() {
@@ -76,14 +160,18 @@ export default function VideoUpload() {
 
   // Live overlay state
   const [liveScores, setLiveScores] = useState<{ rula: number; reba: number } | null>(null);
-  const [liveLandmarks, setLiveLandmarks] = useState<any[]>([]);
 
-  // Refs for analysis
+  // UI state
+  const [configOpen, setConfigOpen] = useState(true);
+
+  // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const poseLandmarkerRef = useRef<any>(null);
   const emaRef = useRef(new EMAFilter(0.25));
   const taskProfileRef = useRef<TaskProfile>(taskProfile);
+
+  useEffect(() => { taskProfileRef.current = taskProfile; }, [taskProfile]);
 
   // ─── FILE HANDLING ─────────────────────────────────────────────────────────
   const handleFile = useCallback((file: File) => {
@@ -100,6 +188,7 @@ export default function VideoUpload() {
     setFramesProcessed(0);
     setResultId(null);
     setErrorMsg(null);
+    setLiveScores(null);
   }, [videoUrl]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -115,27 +204,45 @@ export default function VideoUpload() {
   }, [handleFile]);
 
   // ─── MODEL LOADER ──────────────────────────────────────────────────────────
+  // Use IMAGE running mode for frame-by-frame seeked analysis
   const loadModel = useCallback(async () => {
     if (poseLandmarkerRef.current) return;
     const { PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
     const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_CDN);
-    poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
-      runningMode: 'VIDEO',
-      numPoses: 1,
-      minPoseDetectionConfidence: 0.5,
-      minPosePresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
-    });
+    // Try GPU first, fall back to CPU
+    try {
+      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+        runningMode: 'IMAGE',
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.3,
+        minPosePresenceConfidence: 0.3,
+        minTrackingConfidence: 0.3,
+      });
+    } catch {
+      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
+        runningMode: 'IMAGE',
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.3,
+        minPosePresenceConfidence: 0.3,
+        minTrackingConfidence: 0.3,
+      });
+    }
   }, []);
 
-  // ─── FRAME ANALYSIS ────────────────────────────────────────────────────────
-  const { addSession } = useSessionAdder();
+  // ─── SESSION ADDER ─────────────────────────────────────────────────────────
+  const ctx = useContext(SessionContext);
+  const addSession = useCallback((record: SessionRecord) => {
+    if (ctx) ctx.addSession(record);
+  }, [ctx]);
 
+  // ─── FRAME ANALYSIS ────────────────────────────────────────────────────────
   const analyzeVideo = useCallback(async () => {
     if (!videoFile || !videoUrl) return;
     setAnalysisState('loading-model');
     setErrorMsg(null);
+    setLiveScores(null);
 
     try {
       await loadModel();
@@ -149,16 +256,20 @@ export default function VideoUpload() {
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
+    // Load video metadata
     video.src = videoUrl;
     video.muted = true;
+    video.crossOrigin = 'anonymous';
 
     await new Promise<void>((resolve, reject) => {
       video.onloadedmetadata = () => resolve();
       video.onerror = () => reject(new Error('Video load failed'));
+      setTimeout(() => reject(new Error('Video metadata timeout')), 15000);
     });
 
     const duration = video.duration;
-    const SAMPLE_INTERVAL = 0.5; // seconds between analyzed frames
+    // Sample every 0.5s; for long videos cap at 300 frames to keep it fast
+    const SAMPLE_INTERVAL = Math.max(0.5, duration / 300);
     const frameCount = Math.floor(duration / SAMPLE_INTERVAL);
     setTotalFrames(frameCount);
     setAnalysisState('analyzing');
@@ -166,69 +277,69 @@ export default function VideoUpload() {
 
     const snapshots: ErgoSnapshot[] = [];
     let thumbnailDataUrl: string | undefined;
+    let detectedCount = 0;
 
     for (let i = 0; i < frameCount; i++) {
       const t = i * SAMPLE_INTERVAL;
       video.currentTime = t;
 
+      // Wait for seek to complete
       await new Promise<void>(resolve => {
         const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
         video.addEventListener('seeked', onSeeked);
       });
 
-      // Draw frame to canvas for skeleton overlay
-      canvas.width = video.videoWidth || 640;
-      canvas.height = video.videoHeight || 480;
-      const ctx = canvas.getContext('2d');
-      if (ctx) ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      // Get the displayed size of the video element for correct coordinate mapping
+      const rect = video.getBoundingClientRect();
+      const displayW = rect.width > 0 ? rect.width : video.clientWidth || 640;
+      const displayH = rect.height > 0 ? rect.height : video.clientHeight || 360;
+
+      // Draw video frame to canvas at displayed size (not natural resolution)
+      canvas.width = displayW;
+      canvas.height = displayH;
+      const c2d = canvas.getContext('2d');
+      if (c2d) c2d.drawImage(video, 0, 0, displayW, displayH);
 
       // Capture thumbnail at 25% mark
-      if (i === Math.floor(frameCount * 0.25) && ctx) {
+      if (i === Math.floor(frameCount * 0.25) && c2d) {
         thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.7);
       }
 
-      // Run MediaPipe detection
+      // Run MediaPipe detection in IMAGE mode (works on seeked frames)
       let result: any;
       try {
-        result = poseLandmarkerRef.current.detectForVideo(video, t * 1000);
+        result = poseLandmarkerRef.current.detect(video);
       } catch { continue; }
 
       if (result?.landmarks?.length > 0) {
+        detectedCount++;
         const raw = result.landmarks[0];
         const smoothed = emaRef.current.smooth(raw);
-          const snap = computeSnapshot(smoothed, taskProfileRef.current);
-          if (snap) {
-            snapshots.push({ ...snap, timestamp: t * 1000, landmarks: smoothed });
-          // Draw skeleton overlay on canvas in real time
-          const scores = {
-            rula: snap.rula.score,
-            reba: snap.reba.score,
-          };
+        const snap = computeSnapshot(smoothed, taskProfileRef.current);
+        if (snap) {
+          snapshots.push({ ...snap, timestamp: t * 1000, landmarks: smoothed });
+
+          const scores = { rula: snap.rula.score, reba: snap.reba.score };
           setLiveScores(scores);
-          setLiveLandmarks(smoothed);
-          if (canvas) {
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-              ctx.clearRect(0, 0, canvas.width, canvas.height);
-              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            }
-            drawSkeleton({
-              landmarks: smoothed,
-              scores,
-              canvas,
-              videoWidth: canvas.width,
-              videoHeight: canvas.height,
-            });
-          }
+
+          // Draw video frame + skeleton overlay at displayed size
+          if (c2d) c2d.drawImage(video, 0, 0, displayW, displayH);
+          drawSkeletonOnCanvas(canvas, smoothed, scores, displayW, displayH);
         }
       }
 
       setFramesProcessed(i + 1);
       setProgress(Math.round(((i + 1) / frameCount) * 100));
+
+      // Yield to browser to keep UI responsive
+      if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
     }
 
     if (snapshots.length === 0) {
-      setErrorMsg('No person detected in the video. Ensure the worker is clearly visible and the camera angle is adequate.');
+      const hint = detectedCount === 0
+        ? 'No person detected. Tips: ensure the worker fills at least 30% of the frame, use good lighting, and avoid extreme side angles where the body is mostly occluded.'
+        : 'Person detected but pose could not be computed. Try a video with a clearer view of the full body.';
+      setErrorMsg(hint);
       setAnalysisState('error');
       return;
     }
@@ -255,8 +366,8 @@ export default function VideoUpload() {
     addSession(record);
     setResultId(record.id);
     setAnalysisState('done');
-    toast.success(`Analysis complete: ${record.id}`, {
-      description: `${snapshots.length} frames · Peak risk: ${riskLabel(record.peakRisk)}`,
+    toast.success('Analysis complete!', {
+      description: `${snapshots.length} frames analyzed · Peak risk: ${riskLabel(record.peakRisk)}`,
       action: { label: 'View Report', onClick: () => navigate(`/sessions/${record.id}`) },
     });
   }, [videoFile, videoUrl, loadModel, assessor, department, location, notes, baselineId, addSession, navigate]);
@@ -264,7 +375,7 @@ export default function VideoUpload() {
   const isAnalyzing = analysisState === 'analyzing' || analysisState === 'loading-model';
 
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-6">
+    <div className="p-6 max-w-6xl mx-auto space-y-4">
       {/* Header */}
       <div className="flex items-center gap-3">
         <div className="w-10 h-10 rounded-lg bg-[oklch(0.25_0.04_240)] flex items-center justify-center">
@@ -276,13 +387,12 @@ export default function VideoUpload() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-        {/* Left: Upload + Preview */}
-        <div className="lg:col-span-3 space-y-4">
-          {/* Drop zone */}
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
+        {/* ── Left: Video preview (3/5 width) ────────────────────────────── */}
+        <div className="lg:col-span-3 space-y-3">
           {!videoFile ? (
             <div
-              className={`border-2 border-dashed rounded-xl p-12 flex flex-col items-center justify-center gap-4 cursor-pointer transition-all
+              className={`border-2 border-dashed rounded-xl p-12 flex flex-col items-center justify-center gap-4 cursor-pointer transition-all min-h-[320px]
                 ${isDragging ? 'border-sky-400 bg-sky-50' : 'border-border hover:border-sky-300 hover:bg-slate-50'}`}
               onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
               onDragLeave={() => setIsDragging(false)}
@@ -296,17 +406,11 @@ export default function VideoUpload() {
                 <p className="font-semibold text-foreground">Drop your video here</p>
                 <p className="text-sm text-muted-foreground mt-1">or click to browse · MP4, MOV, WebM, AVI</p>
               </div>
-              <input
-                id="video-input"
-                type="file"
-                accept="video/*"
-                className="hidden"
-                onChange={handleInputChange}
-              />
+              <input id="video-input" type="file" accept="video/*" className="hidden" onChange={handleInputChange} />
             </div>
           ) : (
             <div className="space-y-3">
-              {/* File info bar */}
+              {/* File info */}
               <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border">
                 <FileVideo className="w-5 h-5 text-sky-500 shrink-0" />
                 <div className="flex-1 min-w-0">
@@ -314,50 +418,57 @@ export default function VideoUpload() {
                   <p className="text-xs text-muted-foreground">{(videoFile.size / 1024 / 1024).toFixed(1)} MB</p>
                 </div>
                 <Button
-                  variant="ghost" size="icon"
-                  className="shrink-0 h-7 w-7"
-                  onClick={() => { setVideoFile(null); setVideoUrl(null); setAnalysisState('idle'); }}
+                  variant="ghost" size="icon" className="shrink-0 h-7 w-7"
+                  onClick={() => { setVideoFile(null); setVideoUrl(null); setAnalysisState('idle'); setLiveScores(null); }}
+                  disabled={isAnalyzing}
                 >
                   <X className="w-4 h-4" />
                 </Button>
               </div>
 
-              {/* Video preview */}
+              {/* Video + canvas overlay container */}
               <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
+                {/* The actual video element — hidden during analysis, shown otherwise */}
                 <video
                   ref={videoRef}
                   src={videoUrl ?? undefined}
                   className="w-full h-full object-contain"
+                  style={{ display: isAnalyzing ? 'none' : 'block' }}
                   controls={!isAnalyzing}
                   preload="metadata"
                 />
-                {/* Skeleton canvas overlay — shows video frame + skeleton during analysis */}
+                {/* Canvas shows video frame + skeleton during analysis */}
                 <canvas
                   ref={canvasRef}
-                  className="absolute inset-0 w-full h-full pointer-events-none"
-                  style={{ display: analysisState === 'analyzing' ? 'block' : 'none' }}
+                  className="absolute inset-0 w-full h-full object-contain"
+                  style={{ display: isAnalyzing ? 'block' : 'none' }}
                 />
-                {/* Progress HUD — semi-transparent strip at bottom only, so skeleton is visible */}
+
+                {/* Progress HUD */}
                 {isAnalyzing && (
-                  <div className="absolute bottom-0 left-0 right-0 bg-black/70 px-4 py-3 flex items-center gap-4">
+                  <div className="absolute bottom-0 left-0 right-0 bg-black/70 px-4 py-2.5 flex items-center gap-4">
                     <div className="flex-1">
                       <div className="flex justify-between text-xs text-white/80 mb-1">
-                        <span>{analysisState === 'loading-model' ? 'Loading AI model…' : `Analyzing frame ${framesProcessed} / ${totalFrames}`}</span>
+                        <span>
+                          {analysisState === 'loading-model'
+                            ? 'Loading AI model…'
+                            : `Frame ${framesProcessed} / ${totalFrames}`}
+                        </span>
                         <span>{progress}%</span>
                       </div>
                       <Progress value={progress} className="h-1.5" />
                     </div>
                     {liveScores && (
                       <div className="flex gap-3 text-xs font-mono shrink-0">
-                        <span className="text-white/60">RULA <span className={`font-bold ${liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.rula.toFixed(1)}</span></span>
-                        <span className="text-white/60">REBA <span className={`font-bold ${liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.reba.toFixed(1)}</span></span>
+                        <span className="text-white/60">RULA <span className={`font-bold ${liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.rula.toFixed(0)}</span></span>
+                        <span className="text-white/60">REBA <span className={`font-bold ${liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.reba.toFixed(0)}</span></span>
                       </div>
                     )}
                   </div>
                 )}
               </div>
 
-              {/* Analysis result summary */}
+              {/* Result / error banners */}
               {analysisState === 'done' && resultId && (
                 <div className="flex items-center gap-3 p-4 bg-green-50 border border-green-200 rounded-lg">
                   <CheckCircle2 className="w-5 h-5 text-green-600 shrink-0" />
@@ -365,16 +476,12 @@ export default function VideoUpload() {
                     <p className="text-sm font-semibold text-green-800">Analysis complete</p>
                     <p className="text-xs text-green-700">{framesProcessed} frames analyzed · Session ID: {resultId}</p>
                   </div>
-                  <Button
-                    size="sm"
-                    className="bg-green-600 hover:bg-green-700 text-white gap-1"
-                    onClick={() => navigate(`/sessions/${resultId}`)}
-                  >
+                  <Button size="sm" className="bg-green-600 hover:bg-green-700 text-white gap-1"
+                    onClick={() => navigate(`/sessions/${resultId}`)}>
                     View Report <ChevronRight className="w-3 h-3" />
                   </Button>
                 </div>
               )}
-
               {analysisState === 'error' && (
                 <div className="flex items-start gap-3 p-4 bg-red-50 border border-red-200 rounded-lg">
                   <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
@@ -388,90 +495,98 @@ export default function VideoUpload() {
           )}
         </div>
 
-        {/* Right: Configuration */}
-        <div className="lg:col-span-2 space-y-4">
-          {/* Task Profile */}
+        {/* ── Right: Config + Analyze button (2/5 width) ──────────────────── */}
+        <div className="lg:col-span-2 space-y-3">
+
+          {/* ★ ANALYZE BUTTON — pinned at top, always visible ★ */}
+          <Button
+            className="w-full gap-2 bg-sky-600 hover:bg-sky-700 text-white h-11 text-base font-semibold shadow-md"
+            disabled={!videoFile || isAnalyzing}
+            onClick={analyzeVideo}
+          >
+            {isAnalyzing ? (
+              <>
+                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                {analysisState === 'loading-model' ? 'Loading model…' : `Analyzing… ${progress}%`}
+              </>
+            ) : (
+              <>
+                <Play className="w-5 h-5" />
+                {videoFile ? 'Analyze Video' : 'Upload a video to begin'}
+              </>
+            )}
+          </Button>
+
+          {/* Task Configuration — collapsible */}
           <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-sm flex items-center gap-2">
-                <Settings2 className="w-4 h-4 text-sky-500" />
-                Task Configuration
+            <CardHeader className="pb-2 cursor-pointer select-none" onClick={() => setConfigOpen(o => !o)}>
+              <CardTitle className="text-sm flex items-center justify-between">
+                <span className="flex items-center gap-2">
+                  <Settings2 className="w-4 h-4 text-sky-500" />
+                  Task Configuration
+                </span>
+                {configOpen ? <ChevronUp className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
               </CardTitle>
             </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="space-y-1.5">
-                <Label className="text-xs">Task Name</Label>
-                <Input
-                  value={taskProfile.taskName}
-                  onChange={e => { const p = { ...taskProfile, taskName: e.target.value }; setTaskProfile(p); taskProfileRef.current = p; }}
-                  placeholder="e.g. Assembly Line Station 3"
-                  className="h-8 text-sm"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <Label className="text-xs">Load Weight: <span className="font-semibold text-foreground">{taskProfile.loadWeight} kg</span></Label>
-                <Slider
-                  value={[taskProfile.loadWeight]}
-                  onValueChange={([v]) => { const p = { ...taskProfile, loadWeight: v }; setTaskProfile(p); taskProfileRef.current = p; }}
-                  min={0} max={50} step={0.5}
-                  className="py-1"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <Label className="text-xs">Repetitions/min: <span className="font-semibold text-foreground">{taskProfile.repRate}</span></Label>
-                <Slider
-                  value={[taskProfile.repRate]}
-                  onValueChange={([v]) => { const p = { ...taskProfile, repRate: v }; setTaskProfile(p); taskProfileRef.current = p; }}
-                  min={1} max={60} step={1}
-                  className="py-1"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
+            {configOpen && (
+              <CardContent className="space-y-4 pt-0">
                 <div className="space-y-1.5">
-                  <Label className="text-xs">Duration</Label>
-                  <Select
-                    value={taskProfile.duration}
-                    onValueChange={v => { const p = { ...taskProfile, duration: v as TaskProfile['duration'] }; setTaskProfile(p); taskProfileRef.current = p; }}
-                  >
-                    <SelectTrigger className="h-8 text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="short">Short (&lt;1 hr)</SelectItem>
-                      <SelectItem value="moderate">Moderate (1–2 hr)</SelectItem>
-                      <SelectItem value="long">Long (&gt;2 hr)</SelectItem>
-                    </SelectContent>
-                  </Select>
+                  <Label className="text-xs">Task Name</Label>
+                  <Input
+                    value={taskProfile.taskName}
+                    onChange={e => { const p = { ...taskProfile, taskName: e.target.value }; setTaskProfile(p); taskProfileRef.current = p; }}
+                    placeholder="e.g. Assembly Line Station 3"
+                    className="h-8 text-sm"
+                  />
                 </div>
                 <div className="space-y-1.5">
-                  <Label className="text-xs">Coupling</Label>
-                  <Select
-                    value={taskProfile.coupling}
-                    onValueChange={v => { const p = { ...taskProfile, coupling: v as TaskProfile['coupling'] }; setTaskProfile(p); taskProfileRef.current = p; }}
-                  >
-                    <SelectTrigger className="h-8 text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="good">Good</SelectItem>
-                      <SelectItem value="fair">Fair</SelectItem>
-                      <SelectItem value="poor">Poor</SelectItem>
-                    </SelectContent>
-                  </Select>
+                  <Label className="text-xs">Load Weight: <span className="font-semibold">{taskProfile.loadWeight} kg</span></Label>
+                  <Slider value={[taskProfile.loadWeight]}
+                    onValueChange={([v]) => { const p = { ...taskProfile, loadWeight: v }; setTaskProfile(p); taskProfileRef.current = p; }}
+                    min={0} max={50} step={0.5} className="py-1" />
                 </div>
-              </div>
-            </CardContent>
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Repetitions/min: <span className="font-semibold">{taskProfile.repRate}</span></Label>
+                  <Slider value={[taskProfile.repRate]}
+                    onValueChange={([v]) => { const p = { ...taskProfile, repRate: v }; setTaskProfile(p); taskProfileRef.current = p; }}
+                    min={1} max={60} step={1} className="py-1" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Duration</Label>
+                    <Select value={taskProfile.duration}
+                      onValueChange={v => { const p = { ...taskProfile, duration: v as TaskProfile['duration'] }; setTaskProfile(p); taskProfileRef.current = p; }}>
+                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="short">Short (&lt;1 hr)</SelectItem>
+                        <SelectItem value="moderate">Moderate (1–2 hr)</SelectItem>
+                        <SelectItem value="long">Long (&gt;2 hr)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs">Coupling</Label>
+                    <Select value={taskProfile.coupling}
+                      onValueChange={v => { const p = { ...taskProfile, coupling: v as TaskProfile['coupling'] }; setTaskProfile(p); taskProfileRef.current = p; }}>
+                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="good">Good</SelectItem>
+                        <SelectItem value="fair">Fair</SelectItem>
+                        <SelectItem value="poor">Poor</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </CardContent>
+            )}
           </Card>
 
-          {/* Assessment Metadata */}
+          {/* Assessment Metadata — collapsible */}
           <Card>
-            <CardHeader className="pb-3">
+            <CardHeader className="pb-2">
               <CardTitle className="text-sm">Assessment Details</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-3">
+            <CardContent className="space-y-3 pt-0">
               <div className="space-y-1.5">
                 <Label className="text-xs">Assessor Name</Label>
                 <Input value={assessor} onChange={e => setAssessor(e.target.value)} placeholder="Optional" className="h-8 text-sm" />
@@ -485,11 +600,9 @@ export default function VideoUpload() {
                 <Input value={location} onChange={e => setLocation(e.target.value)} placeholder="e.g. Line 3, Bay 7" className="h-8 text-sm" />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-xs">Reassessment of (Session ID)</Label>
+                <Label className="text-xs">Reassessment of</Label>
                 <Select value={baselineId || 'none'} onValueChange={v => setBaselineId(v === 'none' ? '' : v)}>
-                  <SelectTrigger className="h-8 text-xs">
-                    <SelectValue placeholder="None (new assessment)" />
-                  </SelectTrigger>
+                  <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="None (new assessment)" /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="none">None (new assessment)</SelectItem>
                     {sessions.map(s => (
@@ -505,41 +618,16 @@ export default function VideoUpload() {
             </CardContent>
           </Card>
 
-          {/* Analyze Button */}
-          <Button
-            className="w-full gap-2 bg-sky-600 hover:bg-sky-700 text-white h-10"
-            disabled={!videoFile || isAnalyzing}
-            onClick={analyzeVideo}
-          >
-            {isAnalyzing ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                {analysisState === 'loading-model' ? 'Loading model…' : `Analyzing… ${progress}%`}
-              </>
-            ) : (
-              <>
-                <Play className="w-4 h-4" />
-                Analyze Video
-              </>
-            )}
-          </Button>
+          {/* Detection tips */}
+          <div className="text-xs text-muted-foreground bg-slate-50 rounded-lg p-3 border space-y-1">
+            <p className="font-semibold text-foreground">Tips for best results</p>
+            <p>• Worker should fill at least 30% of the frame</p>
+            <p>• Good lighting, avoid strong backlighting</p>
+            <p>• Side or 45° angle works well; avoid directly behind</p>
+            <p>• Full body visible (head to feet) gives most accurate scores</p>
+          </div>
         </div>
       </div>
     </div>
   );
-}
-
-// ─── Helper hook to add session to context ────────────────────────────────────
-import type { SessionRecord } from '@/lib/ergo-engine';
-import { useContext } from 'react';
-import { SessionContext } from '@/contexts/SessionContext';
-
-function useSessionAdder() {
-  const ctx = useContext(SessionContext);
-  if (!ctx) throw new Error('useSessionAdder must be used within SessionProvider');
-  return {
-    addSession: (record: SessionRecord) => {
-      ctx.addSession(record);
-    },
-  };
 }
