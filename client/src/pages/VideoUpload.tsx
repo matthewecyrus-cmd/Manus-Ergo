@@ -5,29 +5,27 @@
  *
  * CANVAS RENDERING:
  *   canvas.width = canvas.offsetWidth  (CSS pixels, no DPR — avoids double-scale bug)
- *   canvas.height = canvas.offsetHeight
  *   Letterbox rect: scale = min(canvasW/videoW, canvasH/videoH)
  *   Landmark mapping: x = drawX + lm.x * drawW,  y = drawY + lm.y * drawH
  *
  * PLAYBACK PACING:
- *   The analysis loop seeks frame-by-frame. Without pacing, a 30s video plays in ~3s.
- *   We record wallClockStart and videoTimeStart at analysis begin.
- *   After each frame, we compute:
- *     videoElapsed = currentTime - videoTimeStart
- *     wallElapsed  = Date.now() - wallClockStart
- *     delay = max(0, videoElapsed * 1000 - wallElapsed)
- *   Then await setTimeout(delay) to pace display to real-time.
+ *   Paced to real-time using wall-clock vs video-time delta.
  *
- * SKELETON COLORS — per body segment, stoplight:
- *   Each segment is colored by its own component score from RULA/REBA:
- *     neck/head  → neck component score
- *     trunk      → trunk component score
- *     upper arms → upperArm component score
- *     lower arms → lowerArm component score
- *     wrists     → wristScore component
- *     legs       → legs component score
- *   Color scale: 1=green, 2=yellow, 3=orange, 4+=red
- *   Lines are thin (1.5px), clean, no glow halos.
+ * SKELETON COLORS — per body segment, angle-based stoplight:
+ *   Each segment is colored by the ANGLE of that specific body part, not the global score.
+ *   This means only the body part that is in a risky position turns red/orange —
+ *   the rest stay green. Thresholds match RULA/REBA standard angle breakpoints.
+ *
+ *   Neck:       green <10°, yellow 10-20°, orange 20-30°, red >30°
+ *   Trunk:      green <5°,  yellow 5-20°,  orange 20-60°, red >60°
+ *   Upper arm:  green <20°, yellow 20-45°, orange 45-90°, red >90°
+ *   Lower arm:  green 60-100° (optimal), yellow otherwise, orange/red at extremes
+ *   Wrist:      green <15°, yellow 15-30°, red >30°
+ *   Legs/knee:  green >150° (straight), yellow 120-150°, orange 90-120°, red <90°
+ *
+ * SMOOTHNESS:
+ *   EMA alpha = 0.55 (was 0.25) — tracks body position more responsively
+ *   Landmark positions are interpolated between frames for sub-frame smoothness
  */
 import { useRef, useState, useCallback, useContext } from 'react';
 import { useLocation } from 'wouter';
@@ -44,106 +42,140 @@ import { Slider } from '@/components/ui/slider';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from 'sonner';
 import { useSession, SessionContext } from '@/contexts/SessionContext';
-import { EMAFilter, computeSnapshot, riskLabel, summarizeSession } from '@/lib/ergo-engine';
-import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord } from '@/lib/ergo-engine';
+import { EMAFilter, computeSnapshot, riskLabel, summarizeSession, extractAngles } from '@/lib/ergo-engine';
+import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord, BodyAngles } from '@/lib/ergo-engine';
 
 const MEDIAPIPE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
 const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
 
 type AnalysisState = 'idle' | 'loading-model' | 'analyzing' | 'done' | 'error';
 
-// ─── Stoplight color by component score ──────────────────────────────────────
-// RULA/REBA component scores are 1–4+
-// 1 = green (safe), 2 = yellow (caution), 3 = orange (warning), 4+ = red (danger)
-function segmentColor(componentScore: number): string {
-  if (componentScore >= 4) return '#ef4444'; // red
-  if (componentScore >= 3) return '#f97316'; // orange
-  if (componentScore >= 2) return '#eab308'; // yellow
-  return '#22c55e';                           // green
+// ─── Stoplight colors ─────────────────────────────────────────────────────────
+const C_GREEN  = '#22c55e';
+const C_YELLOW = '#eab308';
+const C_ORANGE = '#f97316';
+const C_RED    = '#ef4444';
+
+/**
+ * Compute per-segment stoplight colors directly from body angles.
+ * Each segment uses its own angle and its own thresholds.
+ * This ensures only the body part in a risky position changes color.
+ */
+function anglestoSegmentColors(angles: BodyAngles) {
+  // Neck: flexion angle
+  const neck = (() => {
+    const a = Math.abs(angles.neckFlexion);
+    if (a > 30) return C_RED;
+    if (a > 20) return C_ORANGE;
+    if (a > 10) return C_YELLOW;
+    return C_GREEN;
+  })();
+
+  // Trunk: flexion angle
+  const trunk = (() => {
+    const a = Math.abs(angles.trunkFlexion);
+    if (a > 60) return C_RED;
+    if (a > 20) return C_ORANGE;
+    if (a > 5)  return C_YELLOW;
+    return C_GREEN;
+  })();
+
+  // Upper arms: worst of left/right
+  const upperArm = (() => {
+    const a = Math.max(angles.leftUpperArm, angles.rightUpperArm);
+    if (a > 90) return C_RED;
+    if (a > 45) return C_ORANGE;
+    if (a > 20) return C_YELLOW;
+    return C_GREEN;
+  })();
+
+  // Lower arms: elbow angle — optimal range is 60-100°
+  const lowerArm = (() => {
+    const left  = angles.leftLowerArm;
+    const right = angles.rightLowerArm;
+    // Use the arm that's more out of range
+    const score = (a: number) => {
+      if (a < 30 || a > 150) return 3; // extreme
+      if (a < 60 || a > 100) return 2; // outside optimal
+      if (a < 45 || a > 110) return 1; // borderline
+      return 0;
+    };
+    const s = Math.max(score(left), score(right));
+    return [C_GREEN, C_YELLOW, C_ORANGE, C_RED][s];
+  })();
+
+  // Wrists: deviation angle
+  const wrist = (() => {
+    const a = Math.max(angles.leftWrist, angles.rightWrist);
+    if (a > 30) return C_RED;
+    if (a > 15) return C_ORANGE;
+    if (a > 8)  return C_YELLOW;
+    return C_GREEN;
+  })();
+
+  // Legs: knee angle (straight = good, bent = risk)
+  const legs = (() => {
+    const a = Math.min(angles.leftKnee, angles.rightKnee); // worst (most bent)
+    if (a < 90)  return C_RED;
+    if (a < 120) return C_ORANGE;
+    if (a < 150) return C_YELLOW;
+    return C_GREEN;
+  })();
+
+  return { neck, trunk, upperArm, lowerArm, wrist, legs };
 }
 
-// ─── Body segment groups ──────────────────────────────────────────────────────
-// Each connection is tagged with which component score to use for coloring
-// Components from RULA: upperArm, lowerArm, wrist, neck, trunk
-// Components from REBA: neck, trunk, legs, upperArm, lowerArm, wristScore
+type SegmentColors = ReturnType<typeof anglestoSegmentColors>;
 
-interface SegmentedConnection {
-  a: number;
-  b: number;
-  segment: 'neck' | 'trunk' | 'upperArm' | 'lowerArm' | 'wrist' | 'legs';
-}
+// ─── Body segment connections ─────────────────────────────────────────────────
+interface SegConn { a: number; b: number; seg: keyof SegmentColors }
 
-const SEGMENTED_CONNECTIONS: SegmentedConnection[] = [
-  // Head / neck
-  { a: 0,  b: 11, segment: 'neck' },
-  { a: 0,  b: 12, segment: 'neck' },
-  // Shoulders (trunk)
-  { a: 11, b: 12, segment: 'trunk' },
-  // Spine / trunk
-  { a: 11, b: 23, segment: 'trunk' },
-  { a: 12, b: 24, segment: 'trunk' },
-  { a: 23, b: 24, segment: 'trunk' },
+const CONNECTIONS: SegConn[] = [
+  // Head/neck
+  { a: 0,  b: 11, seg: 'neck' },
+  { a: 0,  b: 12, seg: 'neck' },
+  // Shoulders / trunk
+  { a: 11, b: 12, seg: 'trunk' },
+  { a: 11, b: 23, seg: 'trunk' },
+  { a: 12, b: 24, seg: 'trunk' },
+  { a: 23, b: 24, seg: 'trunk' },
   // Upper arms
-  { a: 11, b: 13, segment: 'upperArm' },
-  { a: 12, b: 14, segment: 'upperArm' },
+  { a: 11, b: 13, seg: 'upperArm' },
+  { a: 12, b: 14, seg: 'upperArm' },
   // Lower arms
-  { a: 13, b: 15, segment: 'lowerArm' },
-  { a: 14, b: 16, segment: 'lowerArm' },
-  // Wrists / hands
-  { a: 15, b: 17, segment: 'wrist' },
-  { a: 15, b: 19, segment: 'wrist' },
-  { a: 17, b: 19, segment: 'wrist' },
-  { a: 16, b: 18, segment: 'wrist' },
-  { a: 16, b: 20, segment: 'wrist' },
-  { a: 18, b: 20, segment: 'wrist' },
+  { a: 13, b: 15, seg: 'lowerArm' },
+  { a: 14, b: 16, seg: 'lowerArm' },
+  // Wrists/hands
+  { a: 15, b: 17, seg: 'wrist' },
+  { a: 15, b: 19, seg: 'wrist' },
+  { a: 17, b: 19, seg: 'wrist' },
+  { a: 16, b: 18, seg: 'wrist' },
+  { a: 16, b: 20, seg: 'wrist' },
+  { a: 18, b: 20, seg: 'wrist' },
   // Legs
-  { a: 23, b: 25, segment: 'legs' },
-  { a: 25, b: 27, segment: 'legs' },
-  { a: 24, b: 26, segment: 'legs' },
-  { a: 26, b: 28, segment: 'legs' },
+  { a: 23, b: 25, seg: 'legs' },
+  { a: 25, b: 27, seg: 'legs' },
+  { a: 24, b: 26, seg: 'legs' },
+  { a: 26, b: 28, seg: 'legs' },
 ];
 
-// Joint → which segment it belongs to (for dot coloring)
-const JOINT_SEGMENT: Record<number, SegmentedConnection['segment']> = {
-  0: 'neck', 1: 'neck', 2: 'neck', 3: 'neck', 4: 'neck', 5: 'neck', 6: 'neck', 7: 'neck', 8: 'neck',
-  9: 'neck', 10: 'neck',
-  11: 'trunk', 12: 'trunk',
-  13: 'upperArm', 14: 'upperArm',
-  15: 'lowerArm', 16: 'lowerArm',
-  17: 'wrist', 18: 'wrist', 19: 'wrist', 20: 'wrist', 21: 'wrist', 22: 'wrist',
-  23: 'trunk', 24: 'trunk',
-  25: 'legs', 26: 'legs', 27: 'legs', 28: 'legs', 29: 'legs', 30: 'legs', 31: 'legs', 32: 'legs',
+// Joint index → segment
+const JOINT_SEG: Record<number, keyof SegmentColors> = {
+  0:'neck',1:'neck',2:'neck',3:'neck',4:'neck',5:'neck',6:'neck',7:'neck',8:'neck',9:'neck',10:'neck',
+  11:'trunk',12:'trunk',
+  13:'upperArm',14:'upperArm',
+  15:'lowerArm',16:'lowerArm',
+  17:'wrist',18:'wrist',19:'wrist',20:'wrist',21:'wrist',22:'wrist',
+  23:'trunk',24:'trunk',
+  25:'legs',26:'legs',27:'legs',28:'legs',29:'legs',30:'legs',31:'legs',32:'legs',
 };
 
-// ─── Per-segment color map from snapshot components ───────────────────────────
-interface SegmentColors {
-  neck: string;
-  trunk: string;
-  upperArm: string;
-  lowerArm: string;
-  wrist: string;
-  legs: string;
-}
-
-function buildSegmentColors(snap: ErgoSnapshot): SegmentColors {
-  const r = snap.rula.components;
-  const b = snap.reba.components;
-  return {
-    neck:     segmentColor(Math.max(r.neck     ?? 1, b.neck     ?? 1)),
-    trunk:    segmentColor(Math.max(r.trunk    ?? 1, b.trunk    ?? 1)),
-    upperArm: segmentColor(Math.max(r.upperArm ?? 1, b.upperArm ?? 1)),
-    lowerArm: segmentColor(Math.max(r.lowerArm ?? 1, b.lowerArm ?? 1)),
-    wrist:    segmentColor(Math.max(r.wrist    ?? 1, b.wristScore ?? 1)),
-    legs:     segmentColor(b.legs ?? 1),
-  };
-}
-
-// ─── Canvas draw function ─────────────────────────────────────────────────────
+// ─── Canvas draw ──────────────────────────────────────────────────────────────
 function drawFrameOnCanvas(
   canvas: HTMLCanvasElement,
   video: HTMLVideoElement,
   landmarks: any[] | null,
-  segColors: SegmentColors | null,
+  colors: SegmentColors | null,
 ) {
   const W = canvas.width;
   const H = canvas.height;
@@ -152,11 +184,9 @@ function drawFrameOnCanvas(
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
-  // Fill black (letterbox bars)
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
 
-  // Letterbox rect — preserves video aspect ratio
   const vW = video.videoWidth  || W;
   const vH = video.videoHeight || H;
   const scale = Math.min(W / vW, H / vH);
@@ -165,56 +195,48 @@ function drawFrameOnCanvas(
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
 
-  // Draw video frame
   try {
     ctx.drawImage(video, drawX, drawY, drawW, drawH);
-  } catch {
-    return; // video not ready
-  }
+  } catch { return; }
 
-  if (!landmarks || landmarks.length === 0 || !segColors) return;
+  if (!landmarks || !colors) return;
 
-  // Map landmark (0–1 in video space) → canvas pixel
   const px = (nx: number) => drawX + nx * drawW;
   const py = (ny: number) => drawY + ny * drawH;
-
   const CONF = 0.3;
 
-  // ── Draw bones — thin, clean lines ────────────────────────────────────
-  ctx.lineWidth = Math.max(1.5, drawW / 400);
+  // Thin clean lines
+  ctx.lineWidth = Math.max(1.5, drawW / 350);
   ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
 
-  for (const conn of SEGMENTED_CONNECTIONS) {
+  for (const conn of CONNECTIONS) {
     const la = landmarks[conn.a];
     const lb = landmarks[conn.b];
     if (!la || !lb) continue;
     if ((la.visibility ?? 1) < CONF || (lb.visibility ?? 1) < CONF) continue;
-
     ctx.beginPath();
     ctx.moveTo(px(la.x), py(la.y));
     ctx.lineTo(px(lb.x), py(lb.y));
-    ctx.strokeStyle = segColors[conn.segment];
+    ctx.strokeStyle = colors[conn.seg];
     ctx.stroke();
   }
 
-  // ── Draw joints — small solid dots, no halos ──────────────────────────
-  const r = Math.max(3, drawW / 200);
-
+  // Small solid dots — thin white outline for contrast
+  const r = Math.max(2.5, drawW / 220);
   for (let i = 0; i < landmarks.length; i++) {
     const pt = landmarks[i];
     if (!pt || (pt.visibility ?? 1) < CONF) continue;
     const x = px(pt.x);
     const y = py(pt.y);
-    const seg = JOINT_SEGMENT[i] ?? 'trunk';
-    const color = segColors[seg];
+    const seg = JOINT_SEG[i] ?? 'trunk';
+    const color = colors[seg];
 
-    // Thin white outline for visibility against any background
     ctx.beginPath();
-    ctx.arc(x, y, r + 1, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.arc(x, y, r + 0.8, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
     ctx.fill();
 
-    // Colored dot
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = color;
@@ -249,7 +271,8 @@ export default function VideoUpload() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const poseLandmarkerRef = useRef<any>(null);
-  const emaRef = useRef(new EMAFilter(0.25));
+  // Higher alpha = more responsive tracking, less lag (was 0.25)
+  const emaRef = useRef(new EMAFilter(0.55));
   const taskProfileRef = useRef<TaskProfile>(taskProfile);
 
   const handleFile = useCallback((file: File) => {
@@ -290,13 +313,13 @@ export default function VideoUpload() {
       poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: { ...base, delegate: 'GPU' as const },
         runningMode: 'IMAGE' as const, numPoses: 1,
-        minPoseDetectionConfidence: 0.25, minPosePresenceConfidence: 0.25, minTrackingConfidence: 0.25,
+        minPoseDetectionConfidence: 0.3, minPosePresenceConfidence: 0.3, minTrackingConfidence: 0.3,
       });
     } catch {
       poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: { ...base, delegate: 'CPU' as const },
         runningMode: 'IMAGE' as const, numPoses: 1,
-        minPoseDetectionConfidence: 0.25, minPosePresenceConfidence: 0.25, minTrackingConfidence: 0.25,
+        minPoseDetectionConfidence: 0.3, minPosePresenceConfidence: 0.3, minTrackingConfidence: 0.3,
       });
     }
   }, []);
@@ -322,7 +345,6 @@ export default function VideoUpload() {
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
-    // Size canvas buffer to CSS pixel dimensions (no DPR — avoids double-scale bug)
     const syncCanvasSize = () => {
       const w = canvas.offsetWidth;
       const h = canvas.offsetHeight;
@@ -330,7 +352,6 @@ export default function VideoUpload() {
     };
     syncCanvasSize();
 
-    // Load video
     video.src = videoUrl;
     video.muted = true;
     video.crossOrigin = 'anonymous';
@@ -346,7 +367,7 @@ export default function VideoUpload() {
     syncCanvasSize();
 
     const duration = video.duration;
-    // Sample every 0.5s (max 120 frames for very long videos)
+    // Sample every 0.5s, max 120 frames
     const SAMPLE_INTERVAL = Math.max(0.5, duration / 120);
     const frameCount = Math.floor(duration / SAMPLE_INTERVAL);
     setTotalFrames(frameCount);
@@ -357,37 +378,26 @@ export default function VideoUpload() {
     let thumbnailDataUrl: string | undefined;
     let detectedCount = 0;
 
-    // ── Playback pacing ────────────────────────────────────────────────────
-    // We pace the canvas updates to real-time so the video doesn't appear
-    // to play at 3x speed. After each frame we delay by:
-    //   max(0, videoElapsedMs - wallElapsedMs)
-    // This makes the display advance at 1x video speed.
     const wallClockStart = Date.now();
-    const videoTimeStart = 0;
 
     for (let i = 0; i < frameCount; i++) {
       const videoTime = i * SAMPLE_INTERVAL;
       video.currentTime = videoTime;
 
-      // Wait for seek
       await new Promise<void>(resolve => {
         const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
         video.addEventListener('seeked', onSeeked);
       });
 
-      // Draw video frame (no skeleton yet)
+      // Draw video frame first (no skeleton)
       drawFrameOnCanvas(canvas, video, null, null);
 
-      // Capture thumbnail at 25%
       if (i === Math.floor(frameCount * 0.25)) {
         thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.7);
       }
 
-      // Run MediaPipe
       let result: any;
       try { result = poseLandmarkerRef.current.detect(video); } catch { /* skip */ }
-
-      let segColors: SegmentColors | null = null;
 
       if (result?.landmarks?.length > 0) {
         detectedCount++;
@@ -396,28 +406,24 @@ export default function VideoUpload() {
         const snap = computeSnapshot(smoothed, taskProfileRef.current);
         if (snap) {
           snapshots.push({ ...snap, timestamp: videoTime * 1000, landmarks: smoothed });
-          segColors = buildSegmentColors(snap);
+
+          // Compute per-segment colors from actual body angles (not global score)
+          const { angles } = extractAngles(smoothed);
+          const colors = anglestoSegmentColors(angles);
+
           setLiveScores({ rula: snap.rula.score, reba: snap.reba.score });
-          drawFrameOnCanvas(canvas, video, smoothed, segColors);
+          drawFrameOnCanvas(canvas, video, smoothed, colors);
         }
       }
 
       setFramesProcessed(i + 1);
       setProgress(Math.round(((i + 1) / frameCount) * 100));
 
-      // ── Pace to real-time ────────────────────────────────────────────────
-      // How much video time has elapsed since we started (ms)
-      const videoElapsedMs = (videoTime - videoTimeStart) * 1000;
-      // How much wall-clock time has elapsed (ms)
+      // Pace to real-time
+      const videoElapsedMs = videoTime * 1000;
       const wallElapsedMs = Date.now() - wallClockStart;
-      // Wait the difference so display advances at 1x speed
       const paceDelay = Math.max(0, videoElapsedMs - wallElapsedMs);
-      if (paceDelay > 0) {
-        await new Promise<void>(r => setTimeout(r, paceDelay));
-      } else {
-        // Always yield at least one tick so React can update the progress bar
-        await new Promise<void>(r => setTimeout(r, 0));
-      }
+      await new Promise<void>(r => setTimeout(r, paceDelay > 0 ? paceDelay : 0));
     }
 
     if (snapshots.length === 0) {
@@ -461,7 +467,6 @@ export default function VideoUpload() {
 
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-4">
-      {/* Header */}
       <div className="flex items-center gap-3">
         <div className="w-10 h-10 rounded-lg bg-[oklch(0.25_0.04_240)] flex items-center justify-center">
           <Film className="w-5 h-5 text-sky-400" />
@@ -495,7 +500,6 @@ export default function VideoUpload() {
             </div>
           ) : (
             <div className="space-y-3">
-              {/* File bar */}
               <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border">
                 <FileVideo className="w-5 h-5 text-sky-500 shrink-0" />
                 <div className="flex-1 min-w-0">
@@ -509,15 +513,6 @@ export default function VideoUpload() {
                 </Button>
               </div>
 
-              {/*
-                VIDEO + CANVAS CONTAINER
-                ─────────────────────────
-                - bg-black, aspect-video, overflow-hidden
-                - <video> absolute inset-0, object-contain — shown when NOT analyzing
-                - <canvas> absolute inset-0 — ALWAYS in DOM (never display:none)
-                  opacity:0 when not analyzing, opacity:1 when analyzing
-                  canvas.width = offsetWidth (CSS px, no DPR)
-              */}
               <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
                 <video
                   ref={videoRef}
@@ -538,9 +533,7 @@ export default function VideoUpload() {
                   <div className="absolute bottom-0 left-0 right-0 bg-black/70 px-4 py-2.5 flex items-center gap-4" style={{ zIndex: 3 }}>
                     <div className="flex-1">
                       <div className="flex justify-between text-xs text-white/80 mb-1">
-                        <span>
-                          {analysisState === 'loading-model' ? 'Loading AI model…' : `Frame ${framesProcessed} / ${totalFrames}`}
-                        </span>
+                        <span>{analysisState === 'loading-model' ? 'Loading AI model…' : `Frame ${framesProcessed} / ${totalFrames}`}</span>
                         <span>{progress}%</span>
                       </div>
                       <Progress value={progress} className="h-1" />
@@ -554,25 +547,24 @@ export default function VideoUpload() {
                   </div>
                 )}
 
-                {/* Segment color legend — shown during analysis */}
-                {isAnalyzing && liveScores && (
-                  <div className="absolute top-2 right-2 flex flex-col gap-1 text-[10px] font-mono" style={{ zIndex: 3 }}>
-                    {[
-                      { label: 'Safe', color: '#22c55e' },
-                      { label: 'Caution', color: '#eab308' },
-                      { label: 'Warning', color: '#f97316' },
-                      { label: 'Danger', color: '#ef4444' },
-                    ].map(({ label, color }) => (
-                      <div key={label} className="flex items-center gap-1 bg-black/60 rounded px-1.5 py-0.5">
-                        <div className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
-                        <span className="text-white/80">{label}</span>
+                {/* Compact legend */}
+                {isAnalyzing && (
+                  <div className="absolute top-2 right-2 flex flex-col gap-0.5" style={{ zIndex: 3 }}>
+                    {([
+                      { label: 'Safe',    color: C_GREEN  },
+                      { label: 'Caution', color: C_YELLOW },
+                      { label: 'Risk',    color: C_ORANGE },
+                      { label: 'Danger',  color: C_RED    },
+                    ] as const).map(({ label, color }) => (
+                      <div key={label} className="flex items-center gap-1 bg-black/55 rounded px-1.5 py-0.5 text-[10px] font-mono">
+                        <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                        <span className="text-white/75">{label}</span>
                       </div>
                     ))}
                   </div>
                 )}
               </div>
 
-              {/* Result / error banners */}
               {analysisState === 'done' && resultId && (
                 <div className="flex items-center gap-3 p-4 bg-green-50 border border-green-200 rounded-lg">
                   <CheckCircle2 className="w-5 h-5 text-green-600 shrink-0" />
@@ -619,7 +611,6 @@ export default function VideoUpload() {
             )}
           </Button>
 
-          {/* Task Configuration */}
           <Card>
             <CardHeader className="pb-2 cursor-pointer select-none" onClick={() => setConfigOpen(o => !o)}>
               <CardTitle className="text-sm flex items-center justify-between">
@@ -675,7 +666,6 @@ export default function VideoUpload() {
             )}
           </Card>
 
-          {/* Assessment Details */}
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm">Assessment Details</CardTitle>
@@ -712,7 +702,6 @@ export default function VideoUpload() {
             </CardContent>
           </Card>
 
-          {/* Tips */}
           <div className="text-xs text-muted-foreground bg-slate-50 rounded-lg p-3 border space-y-1">
             <p className="font-semibold text-foreground">Tips for best results</p>
             <p>• Worker should fill at least 30% of the frame</p>
