@@ -361,8 +361,8 @@ function VideoReplay({ session }: { session: SessionRecord }) {
   // Sort snapshots by timestamp once
   const sortedSnaps = snapshots.slice().sort((a, b) => a.timestamp - b.timestamp);
 
-  // Interpolate landmarks between two adjacent snapshots for smooth overlay
-  const interpolatedLandmarks = useCallback((t: number): { lm: any[]; snap: typeof snapshots[0] } | null => {
+  // Interpolate landmarks AND angles between two adjacent snapshots
+  const interpolatedLandmarks = useCallback((t: number): { lm: any[]; angles: BodyAngles | null } | null => {
     if (!sortedSnaps.length) return null;
     const tMs = t * 1000;
     // Find bracketing pair
@@ -373,10 +373,14 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     }
     const snapA = sortedSnaps[lo];
     const snapB = sortedSnaps[Math.min(lo + 1, sortedSnaps.length - 1)];
-    if (snapA === snapB || !snapA.landmarks?.length) return { lm: snapA.landmarks ?? [], snap: snapA };
+    if (snapA === snapB || !snapA.landmarks?.length) {
+      return { lm: snapA.landmarks ?? [], angles: snapA.angles ?? null };
+    }
     const dt = snapB.timestamp - snapA.timestamp;
     const alpha = dt > 0 ? Math.min(1, Math.max(0, (tMs - snapA.timestamp) / dt)) : 0;
-    if (alpha <= 0 || !snapB.landmarks?.length) return { lm: snapA.landmarks, snap: snapA };
+    if (alpha <= 0 || !snapB.landmarks?.length) {
+      return { lm: snapA.landmarks, angles: snapA.angles ?? null };
+    }
     // Lerp each landmark
     const lm = snapA.landmarks.map((a: any, i: number) => {
       const b = snapB.landmarks?.[i];
@@ -388,7 +392,32 @@ function VideoReplay({ session }: { session: SessionRecord }) {
         visibility: (a.visibility ?? 1) * (1 - alpha) + (b.visibility ?? 1) * alpha,
       };
     });
-    return { lm, snap: alpha < 0.5 ? snapA : snapB };
+    // Lerp stored angles (bypasses gatedAngle visibility gating on interpolated landmarks)
+    const aA = snapA.angles;
+    const aB = snapB.angles;
+    let angles: BodyAngles | null = null;
+    if (aA && aB) {
+      const lerp = (a: number, b: number) => a + (b - a) * alpha;
+      angles = {
+        neckFlexion:   lerp(aA.neckFlexion,   aB.neckFlexion),
+        neckLateral:   lerp(aA.neckLateral,   aB.neckLateral),
+        trunkFlexion:  lerp(aA.trunkFlexion,  aB.trunkFlexion),
+        trunkLateral:  lerp(aA.trunkLateral,  aB.trunkLateral),
+        trunkRotation: lerp(aA.trunkRotation, aB.trunkRotation),
+        leftUpperArm:  lerp(aA.leftUpperArm,  aB.leftUpperArm),
+        rightUpperArm: lerp(aA.rightUpperArm, aB.rightUpperArm),
+        leftLowerArm:  lerp(aA.leftLowerArm,  aB.leftLowerArm),
+        rightLowerArm: lerp(aA.rightLowerArm, aB.rightLowerArm),
+        leftWrist:     lerp(aA.leftWrist,     aB.leftWrist),
+        rightWrist:    lerp(aA.rightWrist,    aB.rightWrist),
+        leftKnee:      lerp(aA.leftKnee,      aB.leftKnee),
+        rightKnee:     lerp(aA.rightKnee,     aB.rightKnee),
+        hipFlexion:    lerp(aA.hipFlexion,    aB.hipFlexion),
+      };
+    } else if (aA) {
+      angles = aA;
+    }
+    return { lm, angles };
   }, [sortedSnaps]);
 
   // Size canvas buffer once on mount (not every frame)
@@ -421,11 +450,13 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     const interp = interpolatedLandmarksRef.current(video.currentTime);
     const lm = interp?.lm ?? null;
     let segColors: SegColors | null = null;
-    if (lm?.length) {
-      try {
-        const { angles } = extractAngles(lm);
-        segColors = getSegmentColors(angles);
-      } catch { /* skip */ }
+    // Use pre-computed interpolated angles — NOT extractAngles on interpolated landmarks
+    // (extractAngles would fail visibility gating on lerped landmarks, returning all zeros → all green)
+    if (interp?.angles) {
+      segColors = getSegmentColors(interp.angles);
+    } else if (lm?.length) {
+      // Fallback for old sessions without stored angles
+      try { const { angles } = extractAngles(lm); segColors = getSegmentColors(angles); } catch { /* skip */ }
     }
 
     drawReplayFrame(ctx, W, H, video, lm ?? [], true, segColors);
