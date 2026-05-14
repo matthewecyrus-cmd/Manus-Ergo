@@ -1,37 +1,43 @@
 /**
  * VideoUpload — ErgoKit
  * =====================
- * Design: Clinical Dashboard — deep navy sidebar, sky-blue accents, ISO risk colors
+ * Architecture:
  *
- * CANVAS RENDERING:
- *   canvas.width = canvas.offsetWidth  (CSS pixels, no DPR — avoids double-scale bug)
- *   Letterbox rect: scale = min(canvasW/videoW, canvasH/videoH)
- *   Landmark mapping: x = drawX + lm.x * drawW,  y = drawY + lm.y * drawH
+ * 1. MediaPipe runs in VIDEO mode with timestamps (not IMAGE mode).
+ *    detectForVideo(video, timestampMs) is called with the actual video timestamp.
+ *    This gives MediaPipe temporal context for better tracking continuity.
  *
- * PLAYBACK PACING:
- *   Paced to real-time using wall-clock vs video-time delta.
+ * 2. Overlay rendering is driven by requestVideoFrameCallback (rVFC) where
+ *    available, with requestAnimationFrame as fallback. This ties the canvas
+ *    redraw to the actual decoded video frame — no arbitrary seek delays.
  *
- * SKELETON COLORS — per body segment, angle-based stoplight:
- *   Each segment is colored by the ANGLE of that specific body part, not the global score.
- *   This means only the body part that is in a risky position turns red/orange —
- *   the rest stay green. Thresholds match RULA/REBA standard angle breakpoints.
+ * 3. Two separate loops:
+ *    - OVERLAY loop (rVFC/rAF): runs every decoded frame, draws skeleton on canvas.
+ *      Stores latest landmarks in a ref. Does NOT update React state.
+ *    - REPORT loop (setInterval, 500ms): reads the latest landmarks ref,
+ *      runs ergo scoring, pushes to snapshots array. Updates React state
+ *      (liveScores, progress) at most every 500ms.
  *
- *   Neck:       green <10°, yellow 10-20°, orange 20-30°, red >30°
- *   Trunk:      green <5°,  yellow 5-20°,  orange 20-60°, red >60°
- *   Upper arm:  green <20°, yellow 20-45°, orange 45-90°, red >90°
- *   Lower arm:  green 60-100° (optimal), yellow otherwise, orange/red at extremes
- *   Wrist:      green <15°, yellow 15-30°, red >30°
- *   Legs/knee:  green >150° (straight), yellow 120-150°, orange 90-120°, red <90°
+ * 4. Skeleton visual weight:
+ *    - lineWidth: 1.5px (scaled by canvas width, max 2px)
+ *    - joint radius: 2.5px max
+ *    - NO white halo rings
+ *    - Default: single clean cyan (#06b6d4) skeleton
+ *    - Risk colors: optional toggle, off by default
  *
- * SMOOTHNESS:
- *   EMA alpha = 0.55 (was 0.25) — tracks body position more responsively
- *   Landmark positions are interpolated between frames for sub-frame smoothness
+ * 5. React state updates are throttled — no setState per frame.
+ *
+ * CANVAS SIZING:
+ *   canvas.width = canvas.offsetWidth (CSS px, no DPR multiply)
+ *   Letterbox: scale = min(W/vW, H/vH), drawX/Y = centered offset
+ *   Landmark mapping: px = drawX + lm.x * drawW
  */
-import { useRef, useState, useCallback, useContext } from 'react';
+import { useRef, useState, useCallback, useContext, useEffect } from 'react';
 import { useLocation } from 'wouter';
 import {
   Upload, Film, Play, CheckCircle2, AlertCircle,
-  Settings2, ChevronRight, X, FileVideo, ChevronDown, ChevronUp
+  Settings2, ChevronRight, X, FileVideo, ChevronDown, ChevronUp,
+  Pause, Square
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -50,117 +56,67 @@ const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmark
 
 type AnalysisState = 'idle' | 'loading-model' | 'analyzing' | 'done' | 'error';
 
-// ─── Stoplight colors ─────────────────────────────────────────────────────────
+// ─── Skeleton colors ──────────────────────────────────────────────────────────
+const CYAN = '#06b6d4';
 const C_GREEN  = '#22c55e';
 const C_YELLOW = '#eab308';
 const C_ORANGE = '#f97316';
 const C_RED    = '#ef4444';
 
-/**
- * Compute per-segment stoplight colors directly from body angles.
- * Each segment uses its own angle and its own thresholds.
- * This ensures only the body part in a risky position changes color.
- */
-function anglestoSegmentColors(angles: BodyAngles) {
-  // Neck: flexion angle
-  const neck = (() => {
-    const a = Math.abs(angles.neckFlexion);
-    if (a > 30) return C_RED;
-    if (a > 20) return C_ORANGE;
-    if (a > 10) return C_YELLOW;
-    return C_GREEN;
-  })();
-
-  // Trunk: flexion angle
-  const trunk = (() => {
-    const a = Math.abs(angles.trunkFlexion);
-    if (a > 60) return C_RED;
-    if (a > 20) return C_ORANGE;
-    if (a > 5)  return C_YELLOW;
-    return C_GREEN;
-  })();
-
-  // Upper arms: worst of left/right
-  const upperArm = (() => {
-    const a = Math.max(angles.leftUpperArm, angles.rightUpperArm);
-    if (a > 90) return C_RED;
-    if (a > 45) return C_ORANGE;
-    if (a > 20) return C_YELLOW;
-    return C_GREEN;
-  })();
-
-  // Lower arms: elbow angle — optimal range is 60-100°
-  const lowerArm = (() => {
-    const left  = angles.leftLowerArm;
-    const right = angles.rightLowerArm;
-    // Use the arm that's more out of range
-    const score = (a: number) => {
-      if (a < 30 || a > 150) return 3; // extreme
-      if (a < 60 || a > 100) return 2; // outside optimal
-      if (a < 45 || a > 110) return 1; // borderline
-      return 0;
-    };
-    const s = Math.max(score(left), score(right));
-    return [C_GREEN, C_YELLOW, C_ORANGE, C_RED][s];
-  })();
-
-  // Wrists: deviation angle
-  const wrist = (() => {
-    const a = Math.max(angles.leftWrist, angles.rightWrist);
-    if (a > 30) return C_RED;
-    if (a > 15) return C_ORANGE;
-    if (a > 8)  return C_YELLOW;
-    return C_GREEN;
-  })();
-
-  // Legs: knee angle (straight = good, bent = risk)
-  const legs = (() => {
-    const a = Math.min(angles.leftKnee, angles.rightKnee); // worst (most bent)
-    if (a < 90)  return C_RED;
-    if (a < 120) return C_ORANGE;
-    if (a < 150) return C_YELLOW;
-    return C_GREEN;
-  })();
-
-  return { neck, trunk, upperArm, lowerArm, wrist, legs };
+function angleToColor(angle: number, thresholds: [number, number, number]): string {
+  const [t1, t2, t3] = thresholds;
+  if (angle > t3) return C_RED;
+  if (angle > t2) return C_ORANGE;
+  if (angle > t1) return C_YELLOW;
+  return C_GREEN;
 }
 
-type SegmentColors = ReturnType<typeof anglestoSegmentColors>;
+function getSegmentColors(angles: BodyAngles) {
+  return {
+    neck:     angleToColor(Math.abs(angles.neckFlexion),   [10, 20, 30]),
+    trunk:    angleToColor(Math.abs(angles.trunkFlexion),  [5,  20, 60]),
+    upperArm: angleToColor(Math.max(angles.leftUpperArm, angles.rightUpperArm), [20, 45, 90]),
+    lowerArm: (() => {
+      const worst = (a: number) => {
+        const d = Math.abs(a - 80); // 80° is optimal
+        return d > 50 ? C_RED : d > 30 ? C_ORANGE : d > 15 ? C_YELLOW : C_GREEN;
+      };
+      const scores = [C_GREEN, C_YELLOW, C_ORANGE, C_RED];
+      const li = scores.indexOf(worst(angles.leftLowerArm));
+      const ri = scores.indexOf(worst(angles.rightLowerArm));
+      return scores[Math.max(li, ri)];
+    })(),
+    wrist:    angleToColor(Math.max(angles.leftWrist, angles.rightWrist), [8, 15, 30]),
+    legs:     (() => {
+      const a = Math.min(angles.leftKnee, angles.rightKnee);
+      if (a < 90)  return C_RED;
+      if (a < 120) return C_ORANGE;
+      if (a < 150) return C_YELLOW;
+      return C_GREEN;
+    })(),
+  };
+}
 
-// ─── Body segment connections ─────────────────────────────────────────────────
-interface SegConn { a: number; b: number; seg: keyof SegmentColors }
+type SegColors = ReturnType<typeof getSegmentColors>;
 
-const CONNECTIONS: SegConn[] = [
-  // Head/neck
-  { a: 0,  b: 11, seg: 'neck' },
-  { a: 0,  b: 12, seg: 'neck' },
-  // Shoulders / trunk
-  { a: 11, b: 12, seg: 'trunk' },
-  { a: 11, b: 23, seg: 'trunk' },
-  { a: 12, b: 24, seg: 'trunk' },
-  { a: 23, b: 24, seg: 'trunk' },
-  // Upper arms
-  { a: 11, b: 13, seg: 'upperArm' },
-  { a: 12, b: 14, seg: 'upperArm' },
-  // Lower arms
-  { a: 13, b: 15, seg: 'lowerArm' },
-  { a: 14, b: 16, seg: 'lowerArm' },
-  // Wrists/hands
-  { a: 15, b: 17, seg: 'wrist' },
-  { a: 15, b: 19, seg: 'wrist' },
-  { a: 17, b: 19, seg: 'wrist' },
-  { a: 16, b: 18, seg: 'wrist' },
-  { a: 16, b: 20, seg: 'wrist' },
-  { a: 18, b: 20, seg: 'wrist' },
-  // Legs
-  { a: 23, b: 25, seg: 'legs' },
-  { a: 25, b: 27, seg: 'legs' },
-  { a: 24, b: 26, seg: 'legs' },
-  { a: 26, b: 28, seg: 'legs' },
+// ─── Skeleton connections ─────────────────────────────────────────────────────
+type Seg = keyof SegColors;
+interface Conn { a: number; b: number; seg: Seg }
+
+const CONNECTIONS: Conn[] = [
+  { a:0,  b:11, seg:'neck' },   { a:0,  b:12, seg:'neck' },
+  { a:11, b:12, seg:'trunk' },  { a:11, b:23, seg:'trunk' },
+  { a:12, b:24, seg:'trunk' },  { a:23, b:24, seg:'trunk' },
+  { a:11, b:13, seg:'upperArm' }, { a:12, b:14, seg:'upperArm' },
+  { a:13, b:15, seg:'lowerArm' }, { a:14, b:16, seg:'lowerArm' },
+  { a:15, b:17, seg:'wrist' },  { a:15, b:19, seg:'wrist' },
+  { a:17, b:19, seg:'wrist' },  { a:16, b:18, seg:'wrist' },
+  { a:16, b:20, seg:'wrist' },  { a:18, b:20, seg:'wrist' },
+  { a:23, b:25, seg:'legs' },   { a:25, b:27, seg:'legs' },
+  { a:24, b:26, seg:'legs' },   { a:26, b:28, seg:'legs' },
 ];
 
-// Joint index → segment
-const JOINT_SEG: Record<number, keyof SegmentColors> = {
+const JOINT_SEG: Record<number, Seg> = {
   0:'neck',1:'neck',2:'neck',3:'neck',4:'neck',5:'neck',6:'neck',7:'neck',8:'neck',9:'neck',10:'neck',
   11:'trunk',12:'trunk',
   13:'upperArm',14:'upperArm',
@@ -170,23 +126,15 @@ const JOINT_SEG: Record<number, keyof SegmentColors> = {
   25:'legs',26:'legs',27:'legs',28:'legs',29:'legs',30:'legs',31:'legs',32:'legs',
 };
 
-// ─── Canvas draw ──────────────────────────────────────────────────────────────
-function drawFrameOnCanvas(
-  canvas: HTMLCanvasElement,
+// ─── Canvas draw — called every decoded frame ─────────────────────────────────
+function drawSkeleton(
+  ctx: CanvasRenderingContext2D,
+  W: number, H: number,
   video: HTMLVideoElement,
-  landmarks: any[] | null,
-  colors: SegmentColors | null,
+  landmarks: any[],
+  riskColors: boolean,
+  segColors: SegColors | null,
 ) {
-  const W = canvas.width;
-  const H = canvas.height;
-  if (W < 4 || H < 4) return;
-
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, W, H);
-
   const vW = video.videoWidth  || W;
   const vH = video.videoHeight || H;
   const scale = Math.min(W / vW, H / vH);
@@ -195,18 +143,14 @@ function drawFrameOnCanvas(
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
 
-  try {
-    ctx.drawImage(video, drawX, drawY, drawW, drawH);
-  } catch { return; }
-
-  if (!landmarks || !colors) return;
-
   const px = (nx: number) => drawX + nx * drawW;
   const py = (ny: number) => drawY + ny * drawH;
-  const CONF = 0.3;
+  const CONF = 0.25;
 
-  // Thin clean lines
-  ctx.lineWidth = Math.max(1.5, drawW / 350);
+  const lw = Math.min(2, Math.max(1.5, drawW / 400));
+  const jr = Math.min(2.5, Math.max(2, drawW / 250));
+
+  ctx.lineWidth = lw;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
 
@@ -218,28 +162,17 @@ function drawFrameOnCanvas(
     ctx.beginPath();
     ctx.moveTo(px(la.x), py(la.y));
     ctx.lineTo(px(lb.x), py(lb.y));
-    ctx.strokeStyle = colors[conn.seg];
+    ctx.strokeStyle = (riskColors && segColors) ? segColors[conn.seg] : CYAN;
     ctx.stroke();
   }
 
-  // Small solid dots — thin white outline for contrast
-  const r = Math.max(2.5, drawW / 220);
   for (let i = 0; i < landmarks.length; i++) {
     const pt = landmarks[i];
     if (!pt || (pt.visibility ?? 1) < CONF) continue;
-    const x = px(pt.x);
-    const y = py(pt.y);
     const seg = JOINT_SEG[i] ?? 'trunk';
-    const color = colors[seg];
-
     ctx.beginPath();
-    ctx.arc(x, y, r + 0.8, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,255,255,0.65)';
-    ctx.fill();
-
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fillStyle = color;
+    ctx.arc(px(pt.x), py(pt.y), jr, 0, Math.PI * 2);
+    ctx.fillStyle = (riskColors && segColors) ? segColors[seg] : CYAN;
     ctx.fill();
   }
 }
@@ -255,11 +188,11 @@ export default function VideoUpload() {
 
   const [analysisState, setAnalysisState] = useState<AnalysisState>('idle');
   const [progress, setProgress] = useState(0);
-  const [framesProcessed, setFramesProcessed] = useState(0);
-  const [totalFrames, setTotalFrames] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [resultId, setResultId] = useState<string | null>(null);
   const [liveScores, setLiveScores] = useState<{ rula: number; reba: number } | null>(null);
+  const [riskColors, setRiskColors] = useState(false);
+  const [framesAnalyzed, setFramesAnalyzed] = useState(0);
 
   const [assessor, setAssessor] = useState('');
   const [department, setDepartment] = useState('');
@@ -271,9 +204,22 @@ export default function VideoUpload() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const poseLandmarkerRef = useRef<any>(null);
-  // Higher alpha = more responsive tracking, less lag (was 0.25)
-  const emaRef = useRef(new EMAFilter(0.55));
+  const emaRef = useRef(new EMAFilter(0.5));
   const taskProfileRef = useRef<TaskProfile>(taskProfile);
+
+  // Refs for the overlay loop — no React state updates per frame
+  const latestLandmarksRef = useRef<any[] | null>(null);
+  const latestSegColorsRef = useRef<SegColors | null>(null);
+  const rVFCHandleRef = useRef<number | null>(null);
+  const rAFHandleRef = useRef<number | null>(null);
+  const reportIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const snapshotsRef = useRef<ErgoSnapshot[]>([]);
+  const thumbnailCapturedRef = useRef(false);
+  const thumbnailDataUrlRef = useRef<string | undefined>(undefined);
+  const lastReportTimeRef = useRef(0);
+  const isRunningRef = useRef(false);
+  const riskColorsRef = useRef(riskColors);
+  useEffect(() => { riskColorsRef.current = riskColors; }, [riskColors]);
 
   const handleFile = useCallback((file: File) => {
     if (!file.type.startsWith('video/')) {
@@ -286,7 +232,7 @@ export default function VideoUpload() {
     setVideoUrl(url);
     setAnalysisState('idle');
     setProgress(0);
-    setFramesProcessed(0);
+    setFramesAnalyzed(0);
     setResultId(null);
     setErrorMsg(null);
     setLiveScores(null);
@@ -309,18 +255,40 @@ export default function VideoUpload() {
     const { PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
     const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_CDN);
     const base = { modelAssetPath: MODEL_URL };
+    const opts = {
+      runningMode: 'VIDEO' as const,
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.3,
+      minPosePresenceConfidence: 0.3,
+      minTrackingConfidence: 0.3,
+    };
     try {
       poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: { ...base, delegate: 'GPU' as const },
-        runningMode: 'IMAGE' as const, numPoses: 1,
-        minPoseDetectionConfidence: 0.3, minPosePresenceConfidence: 0.3, minTrackingConfidence: 0.3,
+        baseOptions: { ...base, delegate: 'GPU' as const }, ...opts,
       });
     } catch {
       poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: { ...base, delegate: 'CPU' as const },
-        runningMode: 'IMAGE' as const, numPoses: 1,
-        minPoseDetectionConfidence: 0.3, minPosePresenceConfidence: 0.3, minTrackingConfidence: 0.3,
+        baseOptions: { ...base, delegate: 'CPU' as const }, ...opts,
       });
+    }
+  }, []);
+
+  const stopLoops = useCallback(() => {
+    isRunningRef.current = false;
+    if (rVFCHandleRef.current !== null) {
+      const v = videoRef.current;
+      if (v && 'cancelVideoFrameCallback' in v) {
+        (v as any).cancelVideoFrameCallback(rVFCHandleRef.current);
+      }
+      rVFCHandleRef.current = null;
+    }
+    if (rAFHandleRef.current !== null) {
+      cancelAnimationFrame(rAFHandleRef.current);
+      rAFHandleRef.current = null;
+    }
+    if (reportIntervalRef.current !== null) {
+      clearInterval(reportIntervalRef.current);
+      reportIntervalRef.current = null;
     }
   }, []);
 
@@ -329,11 +297,177 @@ export default function VideoUpload() {
     sessionCtx?.addSession(record);
   }, [sessionCtx]);
 
+  const finishAnalysis = useCallback(() => {
+    stopLoops();
+    const snapshots = snapshotsRef.current;
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (snapshots.length === 0) {
+      setErrorMsg('No pose detected. Ensure the worker fills at least 30% of the frame with good lighting.');
+      setAnalysisState('error');
+      return;
+    }
+
+    const record = summarizeSession(
+      snapshots, taskProfileRef.current, Math.round(video.duration || 0),
+      'video-upload' as SessionSource,
+      {
+        assessor: assessor || undefined,
+        department: department || undefined,
+        location: workLocation || undefined,
+        notes: notes || undefined,
+        thumbnailDataUrl: thumbnailDataUrlRef.current,
+      },
+    );
+    if (baselineId) (record as any).baselineSessionId = baselineId;
+    (record as any).videoUrl = videoUrl;
+
+    addSession(record);
+    setResultId(record.id);
+    setAnalysisState('done');
+    setProgress(100);
+    toast.success('Analysis complete!', {
+      description: `${snapshots.length} samples · Peak risk: ${riskLabel(record.peakRisk)}`,
+      action: { label: 'View Report', onClick: () => navigate(`/sessions/${record.id}`) },
+    });
+  }, [stopLoops, assessor, department, workLocation, notes, baselineId, videoUrl, addSession, navigate]);
+
+  const startOverlayLoop = useCallback((video: HTMLVideoElement, canvas: HTMLCanvasElement) => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const drawFrame = (timestampMs: number) => {
+      if (!isRunningRef.current) return;
+
+      const W = canvas.width;
+      const H = canvas.height;
+      if (W < 4 || H < 4) return;
+
+      // Draw video frame
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, W, H);
+      try { ctx.drawImage(video, 0, 0, W, H); } catch { /* not ready */ }
+
+      // Run MediaPipe VIDEO mode with actual video timestamp
+      if (poseLandmarkerRef.current && !video.paused && !video.ended) {
+        try {
+          const result = poseLandmarkerRef.current.detectForVideo(video, timestampMs);
+          if (result?.landmarks?.length > 0) {
+            const raw = result.landmarks[0];
+            const smoothed = emaRef.current.smooth(raw);
+            latestLandmarksRef.current = smoothed;
+
+            // Compute segment colors (cheap — just angle math)
+            const { angles } = extractAngles(smoothed);
+            latestSegColorsRef.current = getSegmentColors(angles);
+          } else {
+            latestLandmarksRef.current = null;
+            latestSegColorsRef.current = null;
+          }
+        } catch { /* skip frame */ }
+      }
+
+      // Draw skeleton overlay
+      const lm = latestLandmarksRef.current;
+      if (lm && lm.length > 0) {
+        // Correct letterbox mapping
+        const vW = video.videoWidth  || W;
+        const vH = video.videoHeight || H;
+        const scale = Math.min(W / vW, H / vH);
+        const drawW = vW * scale;
+        const drawH = vH * scale;
+        const drawX = (W - drawW) / 2;
+        const drawY = (H - drawH) / 2;
+
+        // Redraw video into letterbox rect (correct aspect ratio)
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, W, H);
+        try { ctx.drawImage(video, drawX, drawY, drawW, drawH); } catch { /* skip */ }
+
+        drawSkeleton(ctx, W, H, video, lm, riskColorsRef.current, latestSegColorsRef.current);
+      } else {
+        // No skeleton — just draw video correctly letterboxed
+        const vW = video.videoWidth  || W;
+        const vH = video.videoHeight || H;
+        const scale = Math.min(W / vW, H / vH);
+        const drawW = vW * scale;
+        const drawH = vH * scale;
+        const drawX = (W - drawW) / 2;
+        const drawY = (H - drawH) / 2;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, W, H);
+        try { ctx.drawImage(video, drawX, drawY, drawW, drawH); } catch { /* skip */ }
+      }
+
+      // Capture thumbnail at 25% of video
+      if (!thumbnailCapturedRef.current && video.duration > 0 && video.currentTime >= video.duration * 0.25) {
+        thumbnailCapturedRef.current = true;
+        thumbnailDataUrlRef.current = canvas.toDataURL('image/jpeg', 0.7);
+      }
+
+      // Schedule next frame
+      if ('requestVideoFrameCallback' in video) {
+        rVFCHandleRef.current = (video as any).requestVideoFrameCallback(
+          (_: DOMHighResTimeStamp, meta: { mediaTime: number }) => {
+            if (isRunningRef.current) drawFrame(meta.mediaTime * 1000);
+          }
+        );
+      } else {
+        rAFHandleRef.current = requestAnimationFrame(() => {
+          if (isRunningRef.current) drawFrame(performance.now());
+        });
+      }
+    };
+
+    // Kick off the loop
+    if ('requestVideoFrameCallback' in video) {
+      rVFCHandleRef.current = (video as any).requestVideoFrameCallback(
+        (_: DOMHighResTimeStamp, meta: { mediaTime: number }) => {
+          if (isRunningRef.current) drawFrame(meta.mediaTime * 1000);
+        }
+      );
+    } else {
+      rAFHandleRef.current = requestAnimationFrame(() => {
+        if (isRunningRef.current) drawFrame(performance.now());
+      });
+    }
+  }, []);
+
+  const startReportSampler = useCallback((video: HTMLVideoElement) => {
+    // Sample at 500ms intervals — update React state and collect snapshots
+    reportIntervalRef.current = setInterval(() => {
+      if (!isRunningRef.current || video.paused || video.ended) return;
+
+      const lm = latestLandmarksRef.current;
+      if (!lm) return;
+
+      const now = Date.now();
+      if (now - lastReportTimeRef.current < 450) return; // debounce
+      lastReportTimeRef.current = now;
+
+      const snap = computeSnapshot(lm, taskProfileRef.current);
+      if (snap) {
+        snapshotsRef.current.push({ ...snap, timestamp: video.currentTime * 1000, landmarks: lm });
+        setFramesAnalyzed(n => n + 1);
+        setLiveScores({ rula: snap.rula.score, reba: snap.reba.score });
+        if (video.duration > 0) {
+          setProgress(Math.round((video.currentTime / video.duration) * 100));
+        }
+      }
+    }, 500);
+  }, []);
+
   const analyzeVideo = useCallback(async () => {
     if (!videoFile || !videoUrl) return;
     setAnalysisState('loading-model');
     setErrorMsg(null);
     setLiveScores(null);
+    setProgress(0);
+    setFramesAnalyzed(0);
+    snapshotsRef.current = [];
+    thumbnailCapturedRef.current = false;
+    thumbnailDataUrlRef.current = undefined;
 
     try { await loadModel(); } catch {
       setErrorMsg('Failed to load pose detection model. Check your internet connection.');
@@ -345,117 +479,41 @@ export default function VideoUpload() {
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
-    const syncCanvasSize = () => {
-      const w = canvas.offsetWidth;
-      const h = canvas.offsetHeight;
-      if (w > 4 && h > 4) { canvas.width = w; canvas.height = h; }
-    };
-    syncCanvasSize();
+    // Size canvas buffer to CSS pixel dimensions
+    const w = canvas.offsetWidth;
+    const h = canvas.offsetHeight;
+    if (w > 4 && h > 4) { canvas.width = w; canvas.height = h; }
 
-    video.src = videoUrl;
-    video.muted = true;
-    video.crossOrigin = 'anonymous';
-    video.load();
-
-    await new Promise<void>((resolve, reject) => {
-      const onReady = () => { video.removeEventListener('loadeddata', onReady); resolve(); };
-      video.addEventListener('loadeddata', onReady);
-      video.onerror = () => reject(new Error('Video load failed'));
-      setTimeout(() => reject(new Error('Video timeout')), 20000);
-    });
-
-    syncCanvasSize();
-
-    const duration = video.duration;
-    // Sample every 0.5s, max 120 frames
-    const SAMPLE_INTERVAL = Math.max(0.5, duration / 120);
-    const frameCount = Math.floor(duration / SAMPLE_INTERVAL);
-    setTotalFrames(frameCount);
-    setAnalysisState('analyzing');
     emaRef.current.reset();
+    isRunningRef.current = true;
+    setAnalysisState('analyzing');
 
-    const snapshots: ErgoSnapshot[] = [];
-    let thumbnailDataUrl: string | undefined;
-    let detectedCount = 0;
+    // Start video playback
+    video.currentTime = 0;
+    try { await video.play(); } catch { /* autoplay may be blocked */ }
 
-    const wallClockStart = Date.now();
+    // Start overlay loop (tied to video frames)
+    startOverlayLoop(video, canvas);
 
-    for (let i = 0; i < frameCount; i++) {
-      const videoTime = i * SAMPLE_INTERVAL;
-      video.currentTime = videoTime;
+    // Start report sampler (throttled, updates React state)
+    startReportSampler(video);
 
-      await new Promise<void>(resolve => {
-        const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
-        video.addEventListener('seeked', onSeeked);
-      });
+    // Listen for video end
+    const onEnded = () => {
+      video.removeEventListener('ended', onEnded);
+      finishAnalysis();
+    };
+    video.addEventListener('ended', onEnded);
+  }, [videoFile, videoUrl, loadModel, startOverlayLoop, startReportSampler, finishAnalysis]);
 
-      // Draw video frame first (no skeleton)
-      drawFrameOnCanvas(canvas, video, null, null);
+  const stopAnalysis = useCallback(() => {
+    finishAnalysis();
+  }, [finishAnalysis]);
 
-      if (i === Math.floor(frameCount * 0.25)) {
-        thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.7);
-      }
-
-      let result: any;
-      try { result = poseLandmarkerRef.current.detect(video); } catch { /* skip */ }
-
-      if (result?.landmarks?.length > 0) {
-        detectedCount++;
-        const raw = result.landmarks[0];
-        const smoothed = emaRef.current.smooth(raw);
-        const snap = computeSnapshot(smoothed, taskProfileRef.current);
-        if (snap) {
-          snapshots.push({ ...snap, timestamp: videoTime * 1000, landmarks: smoothed });
-
-          // Compute per-segment colors from actual body angles (not global score)
-          const { angles } = extractAngles(smoothed);
-          const colors = anglestoSegmentColors(angles);
-
-          setLiveScores({ rula: snap.rula.score, reba: snap.reba.score });
-          drawFrameOnCanvas(canvas, video, smoothed, colors);
-        }
-      }
-
-      setFramesProcessed(i + 1);
-      setProgress(Math.round(((i + 1) / frameCount) * 100));
-
-      // Pace to real-time
-      const videoElapsedMs = videoTime * 1000;
-      const wallElapsedMs = Date.now() - wallClockStart;
-      const paceDelay = Math.max(0, videoElapsedMs - wallElapsedMs);
-      await new Promise<void>(r => setTimeout(r, paceDelay > 0 ? paceDelay : 0));
-    }
-
-    if (snapshots.length === 0) {
-      setErrorMsg(detectedCount === 0
-        ? 'No person detected. Tips: ensure the worker fills at least 30% of the frame, use good lighting, and avoid extreme side angles.'
-        : 'Person detected but pose could not be computed. Try a video with a clearer view of the full body.');
-      setAnalysisState('error');
-      return;
-    }
-
-    const record = summarizeSession(
-      snapshots, taskProfileRef.current, Math.round(duration),
-      'video-upload' as SessionSource,
-      {
-        assessor: assessor || undefined,
-        department: department || undefined,
-        location: workLocation || undefined,
-        notes: notes || undefined,
-        thumbnailDataUrl,
-      },
-    );
-    if (baselineId) (record as any).baselineSessionId = baselineId;
-    (record as any).videoUrl = videoUrl;
-
-    addSession(record);
-    setResultId(record.id);
-    setAnalysisState('done');
-    toast.success('Analysis complete!', {
-      description: `${snapshots.length} frames analyzed · Peak risk: ${riskLabel(record.peakRisk)}`,
-      action: { label: 'View Report', onClick: () => navigate(`/sessions/${record.id}`) },
-    });
-  }, [videoFile, videoUrl, loadModel, assessor, department, workLocation, notes, baselineId, addSession, navigate]);
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => { stopLoops(); };
+  }, [stopLoops]);
 
   const isAnalyzing = analysisState === 'analyzing' || analysisState === 'loading-model';
 
@@ -500,6 +558,7 @@ export default function VideoUpload() {
             </div>
           ) : (
             <div className="space-y-3">
+              {/* File bar */}
               <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border">
                 <FileVideo className="w-5 h-5 text-sky-500 shrink-0" />
                 <div className="flex-1 min-w-0">
@@ -507,70 +566,86 @@ export default function VideoUpload() {
                   <p className="text-xs text-muted-foreground">{(videoFile.size / 1024 / 1024).toFixed(1)} MB</p>
                 </div>
                 <Button variant="ghost" size="icon" className="shrink-0 h-7 w-7"
-                  onClick={() => { setVideoFile(null); setVideoUrl(null); setAnalysisState('idle'); setLiveScores(null); }}
+                  onClick={() => { stopLoops(); setVideoFile(null); setVideoUrl(null); setAnalysisState('idle'); setLiveScores(null); }}
                   disabled={isAnalyzing}>
                   <X className="w-4 h-4" />
                 </Button>
               </div>
 
+              {/*
+                VIDEO + CANVAS CONTAINER
+                canvas is always in DOM (never display:none) — opacity toggle only
+                During analysis: canvas on top (opacity 1), video hidden (opacity 0)
+                Before/after: video visible with controls, canvas hidden
+              */}
               <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
                 <video
                   ref={videoRef}
                   src={videoUrl ?? undefined}
                   className="absolute inset-0 w-full h-full object-contain"
-                  style={{ zIndex: 1, opacity: isAnalyzing ? 0 : 1, pointerEvents: isAnalyzing ? 'none' : 'auto', transition: 'opacity 0.2s' }}
+                  style={{
+                    zIndex: 1,
+                    opacity: isAnalyzing ? 0 : 1,
+                    pointerEvents: isAnalyzing ? 'none' : 'auto',
+                  }}
                   controls={!isAnalyzing}
                   preload="auto"
+                  playsInline
+                  muted
                 />
                 <canvas
                   ref={canvasRef}
                   className="absolute inset-0 w-full h-full"
-                  style={{ zIndex: 2, pointerEvents: 'none', opacity: isAnalyzing ? 1 : 0, transition: 'opacity 0.2s' }}
+                  style={{
+                    zIndex: 2,
+                    pointerEvents: 'none',
+                    opacity: isAnalyzing ? 1 : 0,
+                  }}
                 />
 
-                {/* Progress HUD */}
+                {/* HUD — only during analysis */}
                 {isAnalyzing && (
-                  <div className="absolute bottom-0 left-0 right-0 bg-black/70 px-4 py-2.5 flex items-center gap-4" style={{ zIndex: 3 }}>
-                    <div className="flex-1">
-                      <div className="flex justify-between text-xs text-white/80 mb-1">
-                        <span>{analysisState === 'loading-model' ? 'Loading AI model…' : `Frame ${framesProcessed} / ${totalFrames}`}</span>
-                        <span>{progress}%</span>
+                  <>
+                    {/* Bottom bar */}
+                    <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-4 pt-6 pb-3 flex items-end gap-4" style={{ zIndex: 3 }}>
+                      <div className="flex-1">
+                        <div className="flex justify-between text-[11px] text-white/70 mb-1">
+                          <span>{analysisState === 'loading-model' ? 'Loading model…' : `${framesAnalyzed} samples`}</span>
+                          {liveScores && (
+                            <span className="font-mono">
+                              RULA <span className={liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}>{liveScores.rula.toFixed(0)}</span>
+                              {'  '}REBA <span className={liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}>{liveScores.reba.toFixed(0)}</span>
+                            </span>
+                          )}
+                        </div>
+                        <Progress value={progress} className="h-0.5 bg-white/20" />
                       </div>
-                      <Progress value={progress} className="h-1" />
+                      <Button size="sm" variant="ghost"
+                        className="h-7 px-2 text-white/70 hover:text-white hover:bg-white/10 gap-1 text-xs shrink-0"
+                        onClick={stopAnalysis}>
+                        <Square className="w-3 h-3" /> Finish
+                      </Button>
                     </div>
-                    {liveScores && (
-                      <div className="flex gap-3 text-xs font-mono shrink-0">
-                        <span className="text-white/60">RULA <span className={`font-bold ${liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.rula.toFixed(0)}</span></span>
-                        <span className="text-white/60">REBA <span className={`font-bold ${liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.reba.toFixed(0)}</span></span>
-                      </div>
-                    )}
-                  </div>
-                )}
 
-                {/* Compact legend */}
-                {isAnalyzing && (
-                  <div className="absolute top-2 right-2 flex flex-col gap-0.5" style={{ zIndex: 3 }}>
-                    {([
-                      { label: 'Safe',    color: C_GREEN  },
-                      { label: 'Caution', color: C_YELLOW },
-                      { label: 'Risk',    color: C_ORANGE },
-                      { label: 'Danger',  color: C_RED    },
-                    ] as const).map(({ label, color }) => (
-                      <div key={label} className="flex items-center gap-1 bg-black/55 rounded px-1.5 py-0.5 text-[10px] font-mono">
-                        <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
-                        <span className="text-white/75">{label}</span>
-                      </div>
-                    ))}
-                  </div>
+                    {/* Risk color toggle — top right */}
+                    <button
+                      className={`absolute top-2 right-2 px-2 py-1 rounded text-[10px] font-mono transition-colors ${riskColors ? 'bg-sky-500/80 text-white' : 'bg-black/50 text-white/60 hover:bg-black/70'}`}
+                      style={{ zIndex: 3 }}
+                      onClick={() => setRiskColors(v => !v)}
+                    >
+                      {riskColors ? '● Risk colors ON' : '○ Risk colors'}
+                    </button>
+                  </>
                 )}
               </div>
 
+              {/* Result / error banners */}
               {analysisState === 'done' && resultId && (
                 <div className="flex items-center gap-3 p-4 bg-green-50 border border-green-200 rounded-lg">
                   <CheckCircle2 className="w-5 h-5 text-green-600 shrink-0" />
                   <div className="flex-1">
                     <p className="text-sm font-semibold text-green-800">Analysis complete</p>
-                    <p className="text-xs text-green-700">{framesProcessed} frames analyzed · Session ID: {resultId}</p>
+                    <p className="text-xs text-green-700">{framesAnalyzed} samples collected</p>
                   </div>
                   <Button size="sm" className="bg-green-600 hover:bg-green-700 text-white gap-1"
                     onClick={() => navigate(`/sessions/${resultId}`)}>
