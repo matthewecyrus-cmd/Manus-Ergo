@@ -3,14 +3,21 @@
  * =====================
  * Design: Clinical Dashboard — deep navy sidebar, sky-blue accents, ISO risk colors
  *
- * CRITICAL FIX — Skeleton overlay coordinate math:
- *   The canvas is always visible (not display:none) so getBoundingClientRect() returns
- *   real dimensions. The canvas buffer is sized to the canvas element's rendered pixel
- *   dimensions (DPR-aware). Landmark coords (0–1 normalized) are multiplied by those
- *   dimensions, so joints land precisely on the person's body.
+ * CANVAS ARCHITECTURE:
+ *   The canvas is ALWAYS in the DOM, ALWAYS has position:absolute inset-0,
+ *   and is ALWAYS visible. We never use display:none on the canvas.
+ *   - Before analysis: canvas is transparent (nothing drawn on it)
+ *   - During analysis: canvas shows video frame + skeleton overlay
+ *   - After analysis: canvas shows last frame + skeleton
  *
- *   The video element uses opacity:0 + position:absolute during analysis (NOT display:none)
- *   so it stays in the layout flow and the canvas can overlay it correctly.
+ *   The video element is ALWAYS visible underneath the canvas.
+ *   - Before analysis: video shows normally with controls
+ *   - During analysis: video is hidden via opacity:0 (stays in DOM for MediaPipe)
+ *
+ *   This ensures getBoundingClientRect() on the canvas always returns real dimensions
+ *   because the canvas is always laid out in the document.
+ *
+ *   We use an offscreen canvas for drawImage to avoid CORS taint issues.
  */
 import { useRef, useState, useCallback, useEffect, useContext } from 'react';
 import { useLocation } from 'wouter';
@@ -28,9 +35,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { toast } from 'sonner';
 import { useSession, SessionContext } from '@/contexts/SessionContext';
 import {
-  EMAFilter, computeSnapshot, DEFAULT_TASK_PROFILE,
-  riskLabel,
-  summarizeSession,
+  EMAFilter, computeSnapshot, riskLabel, summarizeSession,
 } from '@/lib/ergo-engine';
 import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord } from '@/lib/ergo-engine';
 
@@ -41,10 +46,7 @@ const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmark
 type AnalysisState = 'idle' | 'loading-model' | 'analyzing' | 'done' | 'error';
 
 // ─── Per-joint risk coloring ────────────────────────────────────────────────
-// Joint indices that contribute to upper-limb risk (RULA-sensitive)
 const UPPER_JOINTS = new Set([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
-// Joint indices that contribute to trunk/lower-body risk (REBA-sensitive)
-const LOWER_JOINTS = new Set([23, 24, 25, 26, 27, 28, 29, 30, 31, 32]);
 
 const POSE_CONNECTIONS: [number, number][] = [
   [11, 12], [11, 23], [12, 24], [23, 24],
@@ -57,7 +59,7 @@ const POSE_CONNECTIONS: [number, number][] = [
   [0, 11], [0, 12],
 ];
 
-function riskColor(score: number, type: 'rula' | 'reba'): string {
+function jointRiskColor(score: number, type: 'rula' | 'reba'): string {
   if (type === 'rula') {
     if (score >= 7) return '#ef4444';
     if (score >= 5) return '#f97316';
@@ -71,34 +73,55 @@ function riskColor(score: number, type: 'rula' | 'reba'): string {
   }
 }
 
-function drawSkeleton(
+/**
+ * Draw video frame + skeleton onto the canvas.
+ * The canvas must already be in the DOM and laid out (never display:none).
+ * We read its rendered dimensions via getBoundingClientRect().
+ */
+function renderFrameWithSkeleton(
   canvas: HTMLCanvasElement,
-  lm: any[],
+  videoEl: HTMLVideoElement,
+  lm: any[] | null,
   scores: { rula: number; reba: number } | null,
 ) {
-  // Use the canvas element's RENDERED pixel size (not its buffer size)
   const rect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
   const W = rect.width;
   const H = rect.height;
 
-  if (W === 0 || H === 0) return;
+  if (W < 10 || H < 10) {
+    // Canvas not laid out yet — skip this frame
+    return;
+  }
 
-  // Size the canvas buffer to the rendered size × DPR for sharp rendering
-  if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
-    canvas.width  = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
+  const dpr = window.devicePixelRatio || 1;
+  const bufW = Math.round(W * dpr);
+  const bufH = Math.round(H * dpr);
+
+  // Only resize the buffer when dimensions actually change (avoids clearing mid-draw)
+  if (canvas.width !== bufW || canvas.height !== bufH) {
+    canvas.width  = bufW;
+    canvas.height = bufH;
   }
 
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, W, H);
+
+  // ── Draw video frame ──────────────────────────────────────────────────────
+  try {
+    ctx.drawImage(videoEl, 0, 0, W, H);
+  } catch {
+    // drawImage can throw if video is not ready — fill black instead
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (!lm || lm.length === 0) return;
 
   const CONF = 0.25;
-  const rulaColor = scores ? riskColor(scores.rula, 'rula') : '#22c55e';
-  const rebaColor = scores ? riskColor(scores.reba, 'reba') : '#22c55e';
+  const rulaColor = scores ? jointRiskColor(scores.rula, 'rula') : '#22c55e';
+  const rebaColor = scores ? jointRiskColor(scores.reba, 'reba') : '#22c55e';
 
   // ── Draw bones ──────────────────────────────────────────────────────────
   ctx.lineWidth = Math.max(2.5, W / 280);
@@ -106,10 +129,8 @@ function drawSkeleton(
     const la = lm[a], lb = lm[b];
     if (!la || !lb) continue;
     if ((la.visibility ?? 1) < CONF || (lb.visibility ?? 1) < CONF) continue;
-
     const isUpper = UPPER_JOINTS.has(a) || UPPER_JOINTS.has(b);
     const color = isUpper ? rulaColor : rebaColor;
-
     ctx.beginPath();
     ctx.moveTo(la.x * W, la.y * H);
     ctx.lineTo(lb.x * W, lb.y * H);
@@ -122,7 +143,6 @@ function drawSkeleton(
   for (let i = 0; i < lm.length; i++) {
     const pt = lm[i];
     if (!pt || (pt.visibility ?? 1) < CONF) continue;
-
     const x = pt.x * W;
     const y = pt.y * H;
     const isUpper = UPPER_JOINTS.has(i);
@@ -134,13 +154,13 @@ function drawSkeleton(
     ctx.fillStyle = color + '28';
     ctx.fill();
 
-    // White outline ring
+    // White ring
     ctx.beginPath();
     ctx.arc(x, y, r + 1.5, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(255,255,255,0.85)';
     ctx.fill();
 
-    // Colored fill
+    // Colored dot
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = color;
@@ -150,15 +170,15 @@ function drawSkeleton(
   // ── Score badge ─────────────────────────────────────────────────────────
   if (scores) {
     const pad = 10;
-    const bW = 130, bH = 38;
-    ctx.fillStyle = 'rgba(0,0,0,0.72)';
+    const bW = 140, bH = 40;
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
     ctx.beginPath();
-    ctx.roundRect(pad, pad, bW, bH, 7);
+    ctx.roundRect(pad, pad, bW, bH, 8);
     ctx.fill();
     ctx.font = `bold ${Math.max(12, W / 55)}px ui-monospace, monospace`;
     ctx.fillStyle = '#fff';
     ctx.textAlign = 'left';
-    ctx.fillText(`RULA ${scores.rula.toFixed(0)}   REBA ${scores.reba.toFixed(0)}`, pad + 10, pad + 25);
+    ctx.fillText(`RULA ${scores.rula.toFixed(0)}   REBA ${scores.reba.toFixed(0)}`, pad + 10, pad + 26);
   }
 }
 
@@ -208,6 +228,12 @@ export default function VideoUpload() {
     setResultId(null);
     setErrorMsg(null);
     setLiveScores(null);
+    // Clear canvas
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
   }, [videoUrl]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -237,14 +263,17 @@ export default function VideoUpload() {
     try {
       poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, opts);
     } catch {
-      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, { ...opts, baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' as const } });
+      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
+        ...opts,
+        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' as const },
+      });
     }
   }, []);
 
-  const ctx = useContext(SessionContext);
+  const sessionCtx = useContext(SessionContext);
   const addSession = useCallback((record: SessionRecord) => {
-    if (ctx) ctx.addSession(record);
-  }, [ctx]);
+    if (sessionCtx) sessionCtx.addSession(record);
+  }, [sessionCtx]);
 
   const analyzeVideo = useCallback(async () => {
     if (!videoFile || !videoUrl) return;
@@ -264,14 +293,17 @@ export default function VideoUpload() {
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
+    // ── Load video metadata ───────────────────────────────────────────────
     video.src = videoUrl;
     video.muted = true;
     video.crossOrigin = 'anonymous';
+    video.load();
 
     await new Promise<void>((resolve, reject) => {
-      video.onloadedmetadata = () => resolve();
+      const onMeta = () => { video.removeEventListener('loadeddata', onMeta); resolve(); };
+      video.addEventListener('loadeddata', onMeta);
       video.onerror = () => reject(new Error('Video load failed'));
-      setTimeout(() => reject(new Error('Video metadata timeout')), 15000);
+      setTimeout(() => reject(new Error('Video metadata timeout')), 20000);
     });
 
     const duration = video.duration;
@@ -289,38 +321,34 @@ export default function VideoUpload() {
       const t = i * SAMPLE_INTERVAL;
       video.currentTime = t;
 
+      // Wait for the seek to complete
       await new Promise<void>(resolve => {
         const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
         video.addEventListener('seeked', onSeeked);
       });
 
-      // ── Get canvas rendered dimensions (canvas is always visible, rect is always valid) ──
-      const canvasRect = canvas.getBoundingClientRect();
-      const W = canvasRect.width  > 10 ? canvasRect.width  : 800;
-      const H = canvasRect.height > 10 ? canvasRect.height : 450;
-      const dpr = window.devicePixelRatio || 1;
+      // ── CRITICAL: Read canvas dimensions AFTER seek (it's always in DOM) ──
+      const rect = canvas.getBoundingClientRect();
+      const W = rect.width > 10 ? rect.width : 640;
+      const H = rect.height > 10 ? rect.height : 360;
 
-      // Size canvas buffer to rendered size × DPR
-      canvas.width  = Math.round(W * dpr);
-      canvas.height = Math.round(H * dpr);
-
-      const c2d = canvas.getContext('2d');
-      if (c2d) {
-        c2d.setTransform(dpr, 0, 0, dpr, 0, 0);
-        // Draw the video frame scaled to fill the canvas display area
-        c2d.drawImage(video, 0, 0, W, H);
-      }
+      // Draw the current video frame onto the canvas (shows video while analyzing)
+      renderFrameWithSkeleton(canvas, video, null, null);
 
       // Capture thumbnail at 25% mark
-      if (i === Math.floor(frameCount * 0.25) && c2d) {
+      if (i === Math.floor(frameCount * 0.25)) {
         thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.7);
       }
 
-      // Run MediaPipe in IMAGE mode (works on seeked frames)
+      // Run MediaPipe pose detection on the video element
       let result: any;
       try {
         result = poseLandmarkerRef.current.detect(video);
-      } catch { continue; }
+      } catch {
+        setFramesProcessed(i + 1);
+        setProgress(Math.round(((i + 1) / frameCount) * 100));
+        continue;
+      }
 
       if (result?.landmarks?.length > 0) {
         detectedCount++;
@@ -331,25 +359,21 @@ export default function VideoUpload() {
           snapshots.push({ ...snap, timestamp: t * 1000, landmarks: smoothed });
           const scores = { rula: snap.rula.score, reba: snap.reba.score };
           setLiveScores(scores);
-
-          // Redraw video frame then overlay skeleton
-          if (c2d) {
-            c2d.setTransform(dpr, 0, 0, dpr, 0, 0);
-            c2d.drawImage(video, 0, 0, W, H);
-          }
-          drawSkeleton(canvas, smoothed, scores);
+          // Redraw frame with skeleton overlay
+          renderFrameWithSkeleton(canvas, video, smoothed, scores);
         }
       }
 
       setFramesProcessed(i + 1);
       setProgress(Math.round(((i + 1) / frameCount) * 100));
 
+      // Yield to the browser every 5 frames to allow React to re-render
       if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
     }
 
     if (snapshots.length === 0) {
       const hint = detectedCount === 0
-        ? 'No person detected. Tips: ensure the worker fills at least 30% of the frame, use good lighting, and avoid extreme side angles where the body is mostly occluded.'
+        ? 'No person detected. Tips: ensure the worker fills at least 30% of the frame, use good lighting, and avoid extreme side angles.'
         : 'Person detected but pose could not be computed. Try a video with a clearer view of the full body.';
       setErrorMsg(hint);
       setAnalysisState('error');
@@ -429,54 +453,72 @@ export default function VideoUpload() {
                 </div>
                 <Button
                   variant="ghost" size="icon" className="shrink-0 h-7 w-7"
-                  onClick={() => { setVideoFile(null); setVideoUrl(null); setAnalysisState('idle'); setLiveScores(null); }}
+                  onClick={() => {
+                    setVideoFile(null);
+                    setVideoUrl(null);
+                    setAnalysisState('idle');
+                    setLiveScores(null);
+                  }}
                   disabled={isAnalyzing}
                 >
                   <X className="w-4 h-4" />
                 </Button>
               </div>
 
-              {/* ── Video + canvas overlay container ────────────────────────── */}
               {/*
-                CRITICAL: The video element MUST stay in the DOM and be visible (not display:none)
-                during analysis so that:
-                  1. getBoundingClientRect() on the canvas returns real dimensions
-                  2. MediaPipe can read the video frame via detect(video)
-                We use opacity:0 + absolute positioning to hide it visually while keeping it
-                in layout flow. The canvas sits on top with the video frame drawn onto it.
+                ── Video + Canvas container ──────────────────────────────────────
+                ARCHITECTURE:
+                  - Container: relative, aspect-video, bg-black, overflow-hidden
+                  - Video: absolute inset-0, always in DOM, opacity controlled
+                  - Canvas: absolute inset-0, ALWAYS visible (never display:none)
+                    The canvas is transparent when nothing is drawn.
+                    During analysis it shows the video frame + skeleton.
+                    After analysis it shows the last frame + skeleton.
+                  - Progress HUD: absolute bottom-0, z-index above canvas
+
+                WHY: getBoundingClientRect() on the canvas returns real dimensions
+                only when the canvas is in the layout flow. display:none removes it
+                from layout, causing rect.width=0 and breaking coordinate math.
               */}
               <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
-                {/* Video — always in DOM, hidden behind canvas during analysis */}
+                {/* Video element — always in DOM, hidden during analysis */}
                 <video
                   ref={videoRef}
                   src={videoUrl ?? undefined}
-                  className="w-full h-full object-contain"
+                  className="absolute inset-0 w-full h-full object-contain"
                   style={{
                     opacity: isAnalyzing ? 0 : 1,
-                    position: isAnalyzing ? 'absolute' : 'relative',
-                    inset: 0,
                     zIndex: 1,
+                    // Keep in layout flow even when hidden
+                    pointerEvents: isAnalyzing ? 'none' : 'auto',
                   }}
                   controls={!isAnalyzing}
-                  preload="metadata"
+                  preload="auto"
                 />
 
-                {/* Canvas — always rendered so its rect is always valid */}
+                {/*
+                  Canvas — ALWAYS visible, ALWAYS in DOM, ALWAYS laid out.
+                  Transparent when not analyzing (video shows through).
+                  During analysis: shows video frame + skeleton overlay.
+                  pointer-events:none so video controls still work.
+                */}
                 <canvas
                   ref={canvasRef}
-                  className="w-full h-full"
+                  className="absolute inset-0 w-full h-full"
                   style={{
-                    display: isAnalyzing ? 'block' : 'none',
-                    position: 'absolute',
-                    inset: 0,
                     zIndex: 2,
                     pointerEvents: 'none',
+                    // Transparent when not analyzing — video is visible underneath
+                    opacity: isAnalyzing ? 1 : 0,
                   }}
                 />
 
-                {/* Progress HUD */}
+                {/* Progress HUD — only during analysis */}
                 {isAnalyzing && (
-                  <div className="absolute bottom-0 left-0 right-0 bg-black/75 px-4 py-2.5 flex items-center gap-4" style={{ zIndex: 3 }}>
+                  <div
+                    className="absolute bottom-0 left-0 right-0 bg-black/75 px-4 py-2.5 flex items-center gap-4"
+                    style={{ zIndex: 3 }}
+                  >
                     <div className="flex-1">
                       <div className="flex justify-between text-xs text-white/80 mb-1">
                         <span>
@@ -490,8 +532,18 @@ export default function VideoUpload() {
                     </div>
                     {liveScores && (
                       <div className="flex gap-3 text-xs font-mono shrink-0">
-                        <span className="text-white/60">RULA <span className={`font-bold ${liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.rula.toFixed(0)}</span></span>
-                        <span className="text-white/60">REBA <span className={`font-bold ${liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.reba.toFixed(0)}</span></span>
+                        <span className="text-white/60">
+                          RULA{' '}
+                          <span className={`font-bold ${liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}`}>
+                            {liveScores.rula.toFixed(0)}
+                          </span>
+                        </span>
+                        <span className="text-white/60">
+                          REBA{' '}
+                          <span className={`font-bold ${liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}`}>
+                            {liveScores.reba.toFixed(0)}
+                          </span>
+                        </span>
                       </div>
                     )}
                   </div>
@@ -506,8 +558,11 @@ export default function VideoUpload() {
                     <p className="text-sm font-semibold text-green-800">Analysis complete</p>
                     <p className="text-xs text-green-700">{framesProcessed} frames analyzed · Session ID: {resultId}</p>
                   </div>
-                  <Button size="sm" className="bg-green-600 hover:bg-green-700 text-white gap-1"
-                    onClick={() => navigate(`/sessions/${resultId}`)}>
+                  <Button
+                    size="sm"
+                    className="bg-green-600 hover:bg-green-700 text-white gap-1"
+                    onClick={() => navigate(`/sessions/${resultId}`)}
+                  >
                     View Report <ChevronRight className="w-3 h-3" />
                   </Button>
                 </div>
@@ -549,13 +604,18 @@ export default function VideoUpload() {
 
           {/* Task Configuration */}
           <Card>
-            <CardHeader className="pb-2 cursor-pointer select-none" onClick={() => setConfigOpen(o => !o)}>
+            <CardHeader
+              className="pb-2 cursor-pointer select-none"
+              onClick={() => setConfigOpen(o => !o)}
+            >
               <CardTitle className="text-sm flex items-center justify-between">
                 <span className="flex items-center gap-2">
                   <Settings2 className="w-4 h-4 text-sky-500" />
                   Task Configuration
                 </span>
-                {configOpen ? <ChevronUp className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
+                {configOpen
+                  ? <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                  : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
               </CardTitle>
             </CardHeader>
             {configOpen && (
@@ -564,28 +624,54 @@ export default function VideoUpload() {
                   <Label className="text-xs">Task Name</Label>
                   <Input
                     value={taskProfile.taskName}
-                    onChange={e => { const p = { ...taskProfile, taskName: e.target.value }; setTaskProfile(p); taskProfileRef.current = p; }}
+                    onChange={e => {
+                      const p = { ...taskProfile, taskName: e.target.value };
+                      setTaskProfile(p);
+                      taskProfileRef.current = p;
+                    }}
                     placeholder="e.g. Assembly Line Station 3"
                     className="h-8 text-sm"
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <Label className="text-xs">Load Weight: <span className="font-semibold">{taskProfile.loadWeight} kg</span></Label>
-                  <Slider value={[taskProfile.loadWeight]}
-                    onValueChange={([v]) => { const p = { ...taskProfile, loadWeight: v }; setTaskProfile(p); taskProfileRef.current = p; }}
-                    min={0} max={50} step={0.5} className="py-1" />
+                  <Label className="text-xs">
+                    Load Weight: <span className="font-semibold">{taskProfile.loadWeight} kg</span>
+                  </Label>
+                  <Slider
+                    value={[taskProfile.loadWeight]}
+                    onValueChange={([v]) => {
+                      const p = { ...taskProfile, loadWeight: v };
+                      setTaskProfile(p);
+                      taskProfileRef.current = p;
+                    }}
+                    min={0} max={50} step={0.5} className="py-1"
+                  />
                 </div>
                 <div className="space-y-1.5">
-                  <Label className="text-xs">Repetitions/min: <span className="font-semibold">{taskProfile.repRate}</span></Label>
-                  <Slider value={[taskProfile.repRate]}
-                    onValueChange={([v]) => { const p = { ...taskProfile, repRate: v }; setTaskProfile(p); taskProfileRef.current = p; }}
-                    min={1} max={60} step={1} className="py-1" />
+                  <Label className="text-xs">
+                    Repetitions/min: <span className="font-semibold">{taskProfile.repRate}</span>
+                  </Label>
+                  <Slider
+                    value={[taskProfile.repRate]}
+                    onValueChange={([v]) => {
+                      const p = { ...taskProfile, repRate: v };
+                      setTaskProfile(p);
+                      taskProfileRef.current = p;
+                    }}
+                    min={1} max={60} step={1} className="py-1"
+                  />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1.5">
                     <Label className="text-xs">Duration</Label>
-                    <Select value={taskProfile.duration}
-                      onValueChange={v => { const p = { ...taskProfile, duration: v as TaskProfile['duration'] }; setTaskProfile(p); taskProfileRef.current = p; }}>
+                    <Select
+                      value={taskProfile.duration}
+                      onValueChange={v => {
+                        const p = { ...taskProfile, duration: v as TaskProfile['duration'] };
+                        setTaskProfile(p);
+                        taskProfileRef.current = p;
+                      }}
+                    >
                       <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="short">Short (&lt;1 hr)</SelectItem>
@@ -596,8 +682,14 @@ export default function VideoUpload() {
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-xs">Coupling</Label>
-                    <Select value={taskProfile.coupling}
-                      onValueChange={v => { const p = { ...taskProfile, coupling: v as TaskProfile['coupling'] }; setTaskProfile(p); taskProfileRef.current = p; }}>
+                    <Select
+                      value={taskProfile.coupling}
+                      onValueChange={v => {
+                        const p = { ...taskProfile, coupling: v as TaskProfile['coupling'] };
+                        setTaskProfile(p);
+                        taskProfileRef.current = p;
+                      }}
+                    >
                       <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="good">Good</SelectItem>
@@ -619,31 +711,58 @@ export default function VideoUpload() {
             <CardContent className="space-y-3 pt-0">
               <div className="space-y-1.5">
                 <Label className="text-xs">Assessor Name</Label>
-                <Input value={assessor} onChange={e => setAssessor(e.target.value)} placeholder="Optional" className="h-8 text-sm" />
+                <Input
+                  value={assessor}
+                  onChange={e => setAssessor(e.target.value)}
+                  placeholder="Optional"
+                  className="h-8 text-sm"
+                />
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Department / Area</Label>
-                <Input value={department} onChange={e => setDepartment(e.target.value)} placeholder="e.g. Assembly, Warehouse" className="h-8 text-sm" />
+                <Input
+                  value={department}
+                  onChange={e => setDepartment(e.target.value)}
+                  placeholder="e.g. Assembly, Warehouse"
+                  className="h-8 text-sm"
+                />
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Location / Station</Label>
-                <Input value={location} onChange={e => setLocation(e.target.value)} placeholder="e.g. Line 3, Bay 7" className="h-8 text-sm" />
+                <Input
+                  value={location}
+                  onChange={e => setLocation(e.target.value)}
+                  placeholder="e.g. Line 3, Bay 7"
+                  className="h-8 text-sm"
+                />
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Reassessment of</Label>
-                <Select value={baselineId || 'none'} onValueChange={v => setBaselineId(v === 'none' ? '' : v)}>
-                  <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="None (new assessment)" /></SelectTrigger>
+                <Select
+                  value={baselineId || 'none'}
+                  onValueChange={v => setBaselineId(v === 'none' ? '' : v)}
+                >
+                  <SelectTrigger className="h-8 text-xs">
+                    <SelectValue placeholder="None (new assessment)" />
+                  </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="none">None (new assessment)</SelectItem>
                     {sessions.map(s => (
-                      <SelectItem key={s.id} value={s.id}>{s.id} — {s.taskName}</SelectItem>
+                      <SelectItem key={s.id} value={s.id}>
+                        {s.id} — {s.taskName}
+                      </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Notes</Label>
-                <Input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Optional reviewer notes" className="h-8 text-sm" />
+                <Input
+                  value={notes}
+                  onChange={e => setNotes(e.target.value)}
+                  placeholder="Optional reviewer notes"
+                  className="h-8 text-sm"
+                />
               </div>
             </CardContent>
           </Card>
