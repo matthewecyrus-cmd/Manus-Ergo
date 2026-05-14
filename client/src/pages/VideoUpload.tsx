@@ -3,33 +3,31 @@
  * =====================
  * Design: Clinical Dashboard — deep navy sidebar, sky-blue accents, ISO risk colors
  *
- * CANVAS RENDERING — CORRECT APPROACH:
+ * CANVAS RENDERING:
+ *   canvas.width = canvas.offsetWidth  (CSS pixels, no DPR — avoids double-scale bug)
+ *   canvas.height = canvas.offsetHeight
+ *   Letterbox rect: scale = min(canvasW/videoW, canvasH/videoH)
+ *   Landmark mapping: x = drawX + lm.x * drawW,  y = drawY + lm.y * drawH
  *
- *   The canvas element has:
- *     - CSS size:    set by the container (e.g. 640×360 CSS pixels)
- *     - Buffer size: canvas.width / canvas.height (the actual pixel buffer)
+ * PLAYBACK PACING:
+ *   The analysis loop seeks frame-by-frame. Without pacing, a 30s video plays in ~3s.
+ *   We record wallClockStart and videoTimeStart at analysis begin.
+ *   After each frame, we compute:
+ *     videoElapsed = currentTime - videoTimeStart
+ *     wallElapsed  = Date.now() - wallClockStart
+ *     delay = max(0, videoElapsed * 1000 - wallElapsed)
+ *   Then await setTimeout(delay) to pace display to real-time.
  *
- *   We set canvas.width = canvas.offsetWidth and canvas.height = canvas.offsetHeight
- *   (CSS pixels, NOT multiplied by DPR). This means 1 canvas pixel = 1 CSS pixel.
- *   We do NOT use ctx.setTransform(dpr,...) — that causes a double-scale bug where
- *   the skeleton ends up 2× offset from the video.
- *
- *   The video has its own native resolution (e.g. 1920×1080). The canvas is smaller
- *   (e.g. 640×360). We compute a letterbox rect that fits the video's aspect ratio
- *   inside the canvas:
- *
- *     scale = min(canvasW / videoW, canvasH / videoH)
- *     drawW = videoW * scale
- *     drawH = videoH * scale
- *     drawX = (canvasW - drawW) / 2   ← center horizontally
- *     drawY = (canvasH - drawH) / 2   ← center vertically
- *
- *   MediaPipe landmarks are normalized (0–1) relative to the VIDEO frame.
- *   To map to canvas pixels:
- *     canvasX = drawX + landmark.x * drawW
- *     canvasY = drawY + landmark.y * drawH
- *
- *   This is the ONLY correct mapping. Any other approach will produce a floating skeleton.
+ * SKELETON COLORS — per body segment, stoplight:
+ *   Each segment is colored by its own component score from RULA/REBA:
+ *     neck/head  → neck component score
+ *     trunk      → trunk component score
+ *     upper arms → upperArm component score
+ *     lower arms → lowerArm component score
+ *     wrists     → wristScore component
+ *     legs       → legs component score
+ *   Color scale: 1=green, 2=yellow, 3=orange, 4+=red
+ *   Lines are thin (1.5px), clean, no glow halos.
  */
 import { useRef, useState, useCallback, useContext } from 'react';
 import { useLocation } from 'wouter';
@@ -54,41 +52,98 @@ const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmark
 
 type AnalysisState = 'idle' | 'loading-model' | 'analyzing' | 'done' | 'error';
 
-const UPPER_JOINTS = new Set([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
-const POSE_CONNECTIONS: [number, number][] = [
-  [11, 12], [11, 23], [12, 24], [23, 24],
-  [11, 13], [13, 15], [12, 14], [14, 16],
-  [23, 25], [25, 27], [24, 26], [26, 28],
-  [15, 17], [15, 19], [17, 19],
-  [16, 18], [16, 20], [18, 20],
-  [0, 11], [0, 12],
-];
-
-function riskColor(score: number, type: 'rula' | 'reba'): string {
-  if (type === 'rula') {
-    if (score >= 7) return '#ef4444';
-    if (score >= 5) return '#f97316';
-    if (score >= 3) return '#f59e0b';
-    return '#22c55e';
-  }
-  if (score >= 11) return '#ef4444';
-  if (score >= 8) return '#f97316';
-  if (score >= 4) return '#f59e0b';
-  return '#22c55e';
+// ─── Stoplight color by component score ──────────────────────────────────────
+// RULA/REBA component scores are 1–4+
+// 1 = green (safe), 2 = yellow (caution), 3 = orange (warning), 4+ = red (danger)
+function segmentColor(componentScore: number): string {
+  if (componentScore >= 4) return '#ef4444'; // red
+  if (componentScore >= 3) return '#f97316'; // orange
+  if (componentScore >= 2) return '#eab308'; // yellow
+  return '#22c55e';                           // green
 }
 
-/**
- * Draw the video frame + skeleton onto the canvas.
- *
- * IMPORTANT: canvas.width and canvas.height must already be set to the canvas's
- * CSS pixel dimensions (offsetWidth / offsetHeight) before calling this.
- * Do NOT multiply by devicePixelRatio — that causes the double-scale bug.
- */
+// ─── Body segment groups ──────────────────────────────────────────────────────
+// Each connection is tagged with which component score to use for coloring
+// Components from RULA: upperArm, lowerArm, wrist, neck, trunk
+// Components from REBA: neck, trunk, legs, upperArm, lowerArm, wristScore
+
+interface SegmentedConnection {
+  a: number;
+  b: number;
+  segment: 'neck' | 'trunk' | 'upperArm' | 'lowerArm' | 'wrist' | 'legs';
+}
+
+const SEGMENTED_CONNECTIONS: SegmentedConnection[] = [
+  // Head / neck
+  { a: 0,  b: 11, segment: 'neck' },
+  { a: 0,  b: 12, segment: 'neck' },
+  // Shoulders (trunk)
+  { a: 11, b: 12, segment: 'trunk' },
+  // Spine / trunk
+  { a: 11, b: 23, segment: 'trunk' },
+  { a: 12, b: 24, segment: 'trunk' },
+  { a: 23, b: 24, segment: 'trunk' },
+  // Upper arms
+  { a: 11, b: 13, segment: 'upperArm' },
+  { a: 12, b: 14, segment: 'upperArm' },
+  // Lower arms
+  { a: 13, b: 15, segment: 'lowerArm' },
+  { a: 14, b: 16, segment: 'lowerArm' },
+  // Wrists / hands
+  { a: 15, b: 17, segment: 'wrist' },
+  { a: 15, b: 19, segment: 'wrist' },
+  { a: 17, b: 19, segment: 'wrist' },
+  { a: 16, b: 18, segment: 'wrist' },
+  { a: 16, b: 20, segment: 'wrist' },
+  { a: 18, b: 20, segment: 'wrist' },
+  // Legs
+  { a: 23, b: 25, segment: 'legs' },
+  { a: 25, b: 27, segment: 'legs' },
+  { a: 24, b: 26, segment: 'legs' },
+  { a: 26, b: 28, segment: 'legs' },
+];
+
+// Joint → which segment it belongs to (for dot coloring)
+const JOINT_SEGMENT: Record<number, SegmentedConnection['segment']> = {
+  0: 'neck', 1: 'neck', 2: 'neck', 3: 'neck', 4: 'neck', 5: 'neck', 6: 'neck', 7: 'neck', 8: 'neck',
+  9: 'neck', 10: 'neck',
+  11: 'trunk', 12: 'trunk',
+  13: 'upperArm', 14: 'upperArm',
+  15: 'lowerArm', 16: 'lowerArm',
+  17: 'wrist', 18: 'wrist', 19: 'wrist', 20: 'wrist', 21: 'wrist', 22: 'wrist',
+  23: 'trunk', 24: 'trunk',
+  25: 'legs', 26: 'legs', 27: 'legs', 28: 'legs', 29: 'legs', 30: 'legs', 31: 'legs', 32: 'legs',
+};
+
+// ─── Per-segment color map from snapshot components ───────────────────────────
+interface SegmentColors {
+  neck: string;
+  trunk: string;
+  upperArm: string;
+  lowerArm: string;
+  wrist: string;
+  legs: string;
+}
+
+function buildSegmentColors(snap: ErgoSnapshot): SegmentColors {
+  const r = snap.rula.components;
+  const b = snap.reba.components;
+  return {
+    neck:     segmentColor(Math.max(r.neck     ?? 1, b.neck     ?? 1)),
+    trunk:    segmentColor(Math.max(r.trunk    ?? 1, b.trunk    ?? 1)),
+    upperArm: segmentColor(Math.max(r.upperArm ?? 1, b.upperArm ?? 1)),
+    lowerArm: segmentColor(Math.max(r.lowerArm ?? 1, b.lowerArm ?? 1)),
+    wrist:    segmentColor(Math.max(r.wrist    ?? 1, b.wristScore ?? 1)),
+    legs:     segmentColor(b.legs ?? 1),
+  };
+}
+
+// ─── Canvas draw function ─────────────────────────────────────────────────────
 function drawFrameOnCanvas(
   canvas: HTMLCanvasElement,
   video: HTMLVideoElement,
   landmarks: any[] | null,
-  scores: { rula: number; reba: number } | null,
+  segColors: SegmentColors | null,
 ) {
   const W = canvas.width;
   const H = canvas.height;
@@ -97,12 +152,11 @@ function drawFrameOnCanvas(
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
-  // Clear to black
+  // Fill black (letterbox bars)
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
 
-  // ── Compute letterbox rect ──────────────────────────────────────────────
-  // Use the video's native resolution for the aspect ratio
+  // Letterbox rect — preserves video aspect ratio
   const vW = video.videoWidth  || W;
   const vH = video.videoHeight || H;
   const scale = Math.min(W / vW, H / vH);
@@ -111,86 +165,64 @@ function drawFrameOnCanvas(
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
 
-  // ── Draw video frame ────────────────────────────────────────────────────
+  // Draw video frame
   try {
     ctx.drawImage(video, drawX, drawY, drawW, drawH);
   } catch {
-    // video not ready — black frame is fine
-    return;
+    return; // video not ready
   }
 
-  if (!landmarks || landmarks.length === 0) return;
+  if (!landmarks || landmarks.length === 0 || !segColors) return;
 
-  // ── Map landmark coords to canvas pixels ────────────────────────────────
-  // landmark.x and landmark.y are 0–1 normalized relative to the VIDEO frame.
-  // We map them into the letterboxed draw rect.
-  const lx = (nx: number) => drawX + nx * drawW;
-  const ly = (ny: number) => drawY + ny * drawH;
+  // Map landmark (0–1 in video space) → canvas pixel
+  const px = (nx: number) => drawX + nx * drawW;
+  const py = (ny: number) => drawY + ny * drawH;
 
-  const CONF = 0.25;
-  const rulaC = scores ? riskColor(scores.rula, 'rula') : '#22c55e';
-  const rebaC = scores ? riskColor(scores.reba, 'reba') : '#22c55e';
+  const CONF = 0.3;
 
-  // Bones
-  ctx.lineWidth = Math.max(2, drawW / 300);
-  for (const [a, b] of POSE_CONNECTIONS) {
-    const la = landmarks[a];
-    const lb = landmarks[b];
+  // ── Draw bones — thin, clean lines ────────────────────────────────────
+  ctx.lineWidth = Math.max(1.5, drawW / 400);
+  ctx.lineCap = 'round';
+
+  for (const conn of SEGMENTED_CONNECTIONS) {
+    const la = landmarks[conn.a];
+    const lb = landmarks[conn.b];
     if (!la || !lb) continue;
     if ((la.visibility ?? 1) < CONF || (lb.visibility ?? 1) < CONF) continue;
-    const isUpper = UPPER_JOINTS.has(a) || UPPER_JOINTS.has(b);
+
     ctx.beginPath();
-    ctx.moveTo(lx(la.x), ly(la.y));
-    ctx.lineTo(lx(lb.x), ly(lb.y));
-    ctx.strokeStyle = (isUpper ? rulaC : rebaC) + 'cc';
+    ctx.moveTo(px(la.x), py(la.y));
+    ctx.lineTo(px(lb.x), py(lb.y));
+    ctx.strokeStyle = segColors[conn.segment];
     ctx.stroke();
   }
 
-  // Joints
-  const r = Math.max(4, drawW / 140);
+  // ── Draw joints — small solid dots, no halos ──────────────────────────
+  const r = Math.max(3, drawW / 200);
+
   for (let i = 0; i < landmarks.length; i++) {
     const pt = landmarks[i];
     if (!pt || (pt.visibility ?? 1) < CONF) continue;
-    const x = lx(pt.x);
-    const y = ly(pt.y);
-    const color = UPPER_JOINTS.has(i) ? rulaC : rebaC;
+    const x = px(pt.x);
+    const y = py(pt.y);
+    const seg = JOINT_SEGMENT[i] ?? 'trunk';
+    const color = segColors[seg];
 
-    // Glow halo
+    // Thin white outline for visibility against any background
     ctx.beginPath();
-    ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
-    ctx.fillStyle = color + '28';
+    ctx.arc(x, y, r + 1, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
     ctx.fill();
-    // White ring
-    ctx.beginPath();
-    ctx.arc(x, y, r + 1.5, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,255,255,0.9)';
-    ctx.fill();
+
     // Colored dot
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.fill();
   }
-
-  // Score badge (top-left of the video rect, not the canvas)
-  if (scores) {
-    const bx = drawX + 10;
-    const by = drawY + 10;
-    const bW = 148, bH = 38;
-    ctx.fillStyle = 'rgba(0,0,0,0.80)';
-    ctx.beginPath();
-    ctx.roundRect(bx, by, bW, bH, 7);
-    ctx.fill();
-    ctx.font = `bold ${Math.max(12, drawW / 55)}px ui-monospace, monospace`;
-    ctx.fillStyle = '#fff';
-    ctx.textAlign = 'left';
-    ctx.fillText(
-      `RULA ${scores.rula.toFixed(0)}   REBA ${scores.reba.toFixed(0)}`,
-      bx + 10, by + 25,
-    );
-  }
 }
 
+// ─── Component ────────────────────────────────────────────────────────────────
 export default function VideoUpload() {
   const [, navigate] = useLocation();
   const { sessions, taskProfile, setTaskProfile } = useSession();
@@ -290,21 +322,15 @@ export default function VideoUpload() {
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
-    // ── Size the canvas buffer to match its CSS display size ───────────────
-    // We do this ONCE here (canvas is always in DOM so offsetWidth is real).
-    // We do NOT multiply by devicePixelRatio — that causes the double-scale bug
-    // where the skeleton appears 2× offset to the right of the person.
+    // Size canvas buffer to CSS pixel dimensions (no DPR — avoids double-scale bug)
     const syncCanvasSize = () => {
       const w = canvas.offsetWidth;
       const h = canvas.offsetHeight;
-      if (w > 4 && h > 4) {
-        canvas.width  = w;
-        canvas.height = h;
-      }
+      if (w > 4 && h > 4) { canvas.width = w; canvas.height = h; }
     };
     syncCanvasSize();
 
-    // ── Load video ─────────────────────────────────────────────────────────
+    // Load video
     video.src = videoUrl;
     video.muted = true;
     video.crossOrigin = 'anonymous';
@@ -317,12 +343,11 @@ export default function VideoUpload() {
       setTimeout(() => reject(new Error('Video timeout')), 20000);
     });
 
-    // Re-sync canvas size now that video is loaded (container may have reflowed)
     syncCanvasSize();
 
     const duration = video.duration;
-    // Cap at 60 frames for speed; minimum 0.5s interval
-    const SAMPLE_INTERVAL = Math.max(0.5, duration / 60);
+    // Sample every 0.5s (max 120 frames for very long videos)
+    const SAMPLE_INTERVAL = Math.max(0.5, duration / 120);
     const frameCount = Math.floor(duration / SAMPLE_INTERVAL);
     setTotalFrames(frameCount);
     setAnalysisState('analyzing');
@@ -332,16 +357,25 @@ export default function VideoUpload() {
     let thumbnailDataUrl: string | undefined;
     let detectedCount = 0;
 
-    for (let i = 0; i < frameCount; i++) {
-      video.currentTime = i * SAMPLE_INTERVAL;
+    // ── Playback pacing ────────────────────────────────────────────────────
+    // We pace the canvas updates to real-time so the video doesn't appear
+    // to play at 3x speed. After each frame we delay by:
+    //   max(0, videoElapsedMs - wallElapsedMs)
+    // This makes the display advance at 1x video speed.
+    const wallClockStart = Date.now();
+    const videoTimeStart = 0;
 
-      // Wait for seek to complete
+    for (let i = 0; i < frameCount; i++) {
+      const videoTime = i * SAMPLE_INTERVAL;
+      video.currentTime = videoTime;
+
+      // Wait for seek
       await new Promise<void>(resolve => {
         const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
         video.addEventListener('seeked', onSeeked);
       });
 
-      // Draw the current frame (no skeleton yet — just the video)
+      // Draw video frame (no skeleton yet)
       drawFrameOnCanvas(canvas, video, null, null);
 
       // Capture thumbnail at 25%
@@ -349,9 +383,11 @@ export default function VideoUpload() {
         thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.7);
       }
 
-      // Run MediaPipe pose detection
+      // Run MediaPipe
       let result: any;
-      try { result = poseLandmarkerRef.current.detect(video); } catch { /* skip frame */ }
+      try { result = poseLandmarkerRef.current.detect(video); } catch { /* skip */ }
+
+      let segColors: SegmentColors | null = null;
 
       if (result?.landmarks?.length > 0) {
         detectedCount++;
@@ -359,19 +395,29 @@ export default function VideoUpload() {
         const smoothed = emaRef.current.smooth(raw);
         const snap = computeSnapshot(smoothed, taskProfileRef.current);
         if (snap) {
-          snapshots.push({ ...snap, timestamp: i * SAMPLE_INTERVAL * 1000, landmarks: smoothed });
-          const scores = { rula: snap.rula.score, reba: snap.reba.score };
-          setLiveScores(scores);
-          // Redraw frame WITH skeleton
-          drawFrameOnCanvas(canvas, video, smoothed, scores);
+          snapshots.push({ ...snap, timestamp: videoTime * 1000, landmarks: smoothed });
+          segColors = buildSegmentColors(snap);
+          setLiveScores({ rula: snap.rula.score, reba: snap.reba.score });
+          drawFrameOnCanvas(canvas, video, smoothed, segColors);
         }
       }
 
       setFramesProcessed(i + 1);
       setProgress(Math.round(((i + 1) / frameCount) * 100));
 
-      // Yield to browser so React can update the progress bar
-      await new Promise<void>(r => setTimeout(r, 0));
+      // ── Pace to real-time ────────────────────────────────────────────────
+      // How much video time has elapsed since we started (ms)
+      const videoElapsedMs = (videoTime - videoTimeStart) * 1000;
+      // How much wall-clock time has elapsed (ms)
+      const wallElapsedMs = Date.now() - wallClockStart;
+      // Wait the difference so display advances at 1x speed
+      const paceDelay = Math.max(0, videoElapsedMs - wallElapsedMs);
+      if (paceDelay > 0) {
+        await new Promise<void>(r => setTimeout(r, paceDelay));
+      } else {
+        // Always yield at least one tick so React can update the progress bar
+        await new Promise<void>(r => setTimeout(r, 0));
+      }
     }
 
     if (snapshots.length === 0) {
@@ -427,7 +473,7 @@ export default function VideoUpload() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
-        {/* ── Left: video area (3/5) ─────────────────────────────────────── */}
+        {/* Left: video (3/5) */}
         <div className="lg:col-span-3 space-y-3">
           {!videoFile ? (
             <div
@@ -449,7 +495,7 @@ export default function VideoUpload() {
             </div>
           ) : (
             <div className="space-y-3">
-              {/* File info */}
+              {/* File bar */}
               <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border">
                 <FileVideo className="w-5 h-5 text-sky-500 shrink-0" />
                 <div className="flex-1 min-w-0">
@@ -465,86 +511,63 @@ export default function VideoUpload() {
 
               {/*
                 VIDEO + CANVAS CONTAINER
-                ─────────────────────────────────────────────────────────────
-                Layout: bg-black container, aspect-video (16:9), overflow-hidden.
-
-                Two children, both absolute inset-0:
-                  1. <video>  — native player, shown when NOT analyzing
-                               object-contain so the browser letterboxes it
-                  2. <canvas> — ALWAYS in DOM (never display:none)
-                               shown when analyzing (opacity:1), hidden otherwise (opacity:0)
-                               We draw the video frame + skeleton onto it ourselves.
-
-                The canvas buffer size is set to canvas.offsetWidth × canvas.offsetHeight
-                (CSS pixels, NOT × devicePixelRatio). This ensures 1 canvas pixel = 1 CSS pixel
-                and the skeleton coordinate math works correctly.
+                ─────────────────────────
+                - bg-black, aspect-video, overflow-hidden
+                - <video> absolute inset-0, object-contain — shown when NOT analyzing
+                - <canvas> absolute inset-0 — ALWAYS in DOM (never display:none)
+                  opacity:0 when not analyzing, opacity:1 when analyzing
+                  canvas.width = offsetWidth (CSS px, no DPR)
               */}
               <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
-                {/* Native video — visible only when not analyzing */}
                 <video
                   ref={videoRef}
                   src={videoUrl ?? undefined}
                   className="absolute inset-0 w-full h-full object-contain"
-                  style={{
-                    zIndex: 1,
-                    opacity: isAnalyzing ? 0 : 1,
-                    pointerEvents: isAnalyzing ? 'none' : 'auto',
-                    transition: 'opacity 0.2s',
-                  }}
+                  style={{ zIndex: 1, opacity: isAnalyzing ? 0 : 1, pointerEvents: isAnalyzing ? 'none' : 'auto', transition: 'opacity 0.2s' }}
                   controls={!isAnalyzing}
                   preload="auto"
                 />
-
-                {/*
-                  Canvas — ALWAYS in DOM so offsetWidth/offsetHeight are always real.
-                  We never set display:none on this element.
-                  opacity:0 when not analyzing (video shows through underneath).
-                  During analysis: we draw the video frame + skeleton here.
-                */}
                 <canvas
                   ref={canvasRef}
                   className="absolute inset-0 w-full h-full"
-                  style={{
-                    zIndex: 2,
-                    pointerEvents: 'none',
-                    opacity: isAnalyzing ? 1 : 0,
-                    transition: 'opacity 0.2s',
-                  }}
+                  style={{ zIndex: 2, pointerEvents: 'none', opacity: isAnalyzing ? 1 : 0, transition: 'opacity 0.2s' }}
                 />
 
                 {/* Progress HUD */}
                 {isAnalyzing && (
-                  <div
-                    className="absolute bottom-0 left-0 right-0 bg-black/75 px-4 py-2.5 flex items-center gap-4"
-                    style={{ zIndex: 3 }}
-                  >
+                  <div className="absolute bottom-0 left-0 right-0 bg-black/70 px-4 py-2.5 flex items-center gap-4" style={{ zIndex: 3 }}>
                     <div className="flex-1">
                       <div className="flex justify-between text-xs text-white/80 mb-1">
                         <span>
-                          {analysisState === 'loading-model'
-                            ? 'Loading AI model…'
-                            : `Frame ${framesProcessed} / ${totalFrames}`}
+                          {analysisState === 'loading-model' ? 'Loading AI model…' : `Frame ${framesProcessed} / ${totalFrames}`}
                         </span>
                         <span>{progress}%</span>
                       </div>
-                      <Progress value={progress} className="h-1.5" />
+                      <Progress value={progress} className="h-1" />
                     </div>
                     {liveScores && (
                       <div className="flex gap-3 text-xs font-mono shrink-0">
-                        <span className="text-white/60">
-                          RULA{' '}
-                          <span className={`font-bold ${liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}`}>
-                            {liveScores.rula.toFixed(0)}
-                          </span>
-                        </span>
-                        <span className="text-white/60">
-                          REBA{' '}
-                          <span className={`font-bold ${liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}`}>
-                            {liveScores.reba.toFixed(0)}
-                          </span>
-                        </span>
+                        <span className="text-white/60">RULA <span className={`font-bold ${liveScores.rula >= 5 ? 'text-red-400' : liveScores.rula >= 3 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.rula.toFixed(0)}</span></span>
+                        <span className="text-white/60">REBA <span className={`font-bold ${liveScores.reba >= 8 ? 'text-red-400' : liveScores.reba >= 4 ? 'text-amber-400' : 'text-green-400'}`}>{liveScores.reba.toFixed(0)}</span></span>
                       </div>
                     )}
+                  </div>
+                )}
+
+                {/* Segment color legend — shown during analysis */}
+                {isAnalyzing && liveScores && (
+                  <div className="absolute top-2 right-2 flex flex-col gap-1 text-[10px] font-mono" style={{ zIndex: 3 }}>
+                    {[
+                      { label: 'Safe', color: '#22c55e' },
+                      { label: 'Caution', color: '#eab308' },
+                      { label: 'Warning', color: '#f97316' },
+                      { label: 'Danger', color: '#ef4444' },
+                    ].map(({ label, color }) => (
+                      <div key={label} className="flex items-center gap-1 bg-black/60 rounded px-1.5 py-0.5">
+                        <div className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
+                        <span className="text-white/80">{label}</span>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -576,7 +599,7 @@ export default function VideoUpload() {
           )}
         </div>
 
-        {/* ── Right: controls (2/5) ──────────────────────────────────────── */}
+        {/* Right: controls (2/5) */}
         <div className="lg:col-span-2 space-y-3">
           <Button
             className="w-full gap-2 bg-sky-600 hover:bg-sky-700 text-white h-12 text-base font-semibold shadow-md"
@@ -604,36 +627,30 @@ export default function VideoUpload() {
                   <Settings2 className="w-4 h-4 text-sky-500" />
                   Task Configuration
                 </span>
-                {configOpen
-                  ? <ChevronUp className="w-4 h-4 text-muted-foreground" />
-                  : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
+                {configOpen ? <ChevronUp className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
               </CardTitle>
             </CardHeader>
             {configOpen && (
               <CardContent className="space-y-4 pt-0">
                 <div className="space-y-1.5">
                   <Label className="text-xs">Task Name</Label>
-                  <Input value={taskProfile.taskName}
-                    onChange={e => updateProfile({ taskName: e.target.value })}
+                  <Input value={taskProfile.taskName} onChange={e => updateProfile({ taskName: e.target.value })}
                     placeholder="e.g. Assembly Line Station 3" className="h-8 text-sm" />
                 </div>
                 <div className="space-y-1.5">
                   <Label className="text-xs">Load Weight: <span className="font-semibold">{taskProfile.loadWeight} kg</span></Label>
-                  <Slider value={[taskProfile.loadWeight]}
-                    onValueChange={([v]) => updateProfile({ loadWeight: v })}
+                  <Slider value={[taskProfile.loadWeight]} onValueChange={([v]) => updateProfile({ loadWeight: v })}
                     min={0} max={50} step={0.5} className="py-1" />
                 </div>
                 <div className="space-y-1.5">
                   <Label className="text-xs">Repetitions/min: <span className="font-semibold">{taskProfile.repRate}</span></Label>
-                  <Slider value={[taskProfile.repRate]}
-                    onValueChange={([v]) => updateProfile({ repRate: v })}
+                  <Slider value={[taskProfile.repRate]} onValueChange={([v]) => updateProfile({ repRate: v })}
                     min={1} max={60} step={1} className="py-1" />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1.5">
                     <Label className="text-xs">Duration</Label>
-                    <Select value={taskProfile.duration}
-                      onValueChange={v => updateProfile({ duration: v as TaskProfile['duration'] })}>
+                    <Select value={taskProfile.duration} onValueChange={v => updateProfile({ duration: v as TaskProfile['duration'] })}>
                       <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="short">Short (&lt;1 hr)</SelectItem>
@@ -644,8 +661,7 @@ export default function VideoUpload() {
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-xs">Coupling</Label>
-                    <Select value={taskProfile.coupling}
-                      onValueChange={v => updateProfile({ coupling: v as TaskProfile['coupling'] })}>
+                    <Select value={taskProfile.coupling} onValueChange={v => updateProfile({ coupling: v as TaskProfile['coupling'] })}>
                       <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="good">Good</SelectItem>
@@ -667,25 +683,20 @@ export default function VideoUpload() {
             <CardContent className="space-y-3 pt-0">
               <div className="space-y-1.5">
                 <Label className="text-xs">Assessor Name</Label>
-                <Input value={assessor} onChange={e => setAssessor(e.target.value)}
-                  placeholder="Optional" className="h-8 text-sm" />
+                <Input value={assessor} onChange={e => setAssessor(e.target.value)} placeholder="Optional" className="h-8 text-sm" />
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Department / Area</Label>
-                <Input value={department} onChange={e => setDepartment(e.target.value)}
-                  placeholder="e.g. Assembly, Warehouse" className="h-8 text-sm" />
+                <Input value={department} onChange={e => setDepartment(e.target.value)} placeholder="e.g. Assembly, Warehouse" className="h-8 text-sm" />
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Location / Station</Label>
-                <Input value={workLocation} onChange={e => setWorkLocation(e.target.value)}
-                  placeholder="e.g. Line 3, Bay 7" className="h-8 text-sm" />
+                <Input value={workLocation} onChange={e => setWorkLocation(e.target.value)} placeholder="e.g. Line 3, Bay 7" className="h-8 text-sm" />
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Reassessment of</Label>
                 <Select value={baselineId || 'none'} onValueChange={v => setBaselineId(v === 'none' ? '' : v)}>
-                  <SelectTrigger className="h-8 text-xs">
-                    <SelectValue placeholder="None (new assessment)" />
-                  </SelectTrigger>
+                  <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="None (new assessment)" /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="none">None (new assessment)</SelectItem>
                     {sessions.map(s => (
@@ -696,8 +707,7 @@ export default function VideoUpload() {
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Notes</Label>
-                <Input value={notes} onChange={e => setNotes(e.target.value)}
-                  placeholder="Optional reviewer notes" className="h-8 text-sm" />
+                <Input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Optional reviewer notes" className="h-8 text-sm" />
               </div>
             </CardContent>
           </Card>
