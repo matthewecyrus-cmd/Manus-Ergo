@@ -32,8 +32,8 @@ import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useSession } from '@/contexts/SessionContext';
-import { riskBgClass, riskLabel, riskColor, buildBodyRegions, generateRecommendations } from '@/lib/ergo-engine';
-import { drawSkeleton } from '@/lib/skeleton-overlay';
+import { riskBgClass, riskLabel, riskColor, buildBodyRegions, generateRecommendations, extractAngles } from '@/lib/ergo-engine';
+import type { BodyAngles } from '@/lib/ergo-engine';
 import { toast } from 'sonner';
 import type {
   CorrectiveAction, ActionStatus, ActionPriority, SessionRecord, RiskLevel,
@@ -220,13 +220,128 @@ function ScoreCard({ type, score, riskLevel }: {
 }
 
 // ─── Video replay with skeleton overlay ──────────────────────────────────────
+// ─── Per-segment angle-based colors (same as VideoUpload) ────────────────────
+const C_GREEN  = '#22c55e';
+const C_YELLOW = '#eab308';
+const C_ORANGE = '#f97316';
+const C_RED    = '#ef4444';
+const CYAN     = '#06b6d4';
+
+function angleToColor(angle: number, thresholds: [number, number, number]): string {
+  if (angle > thresholds[2]) return C_RED;
+  if (angle > thresholds[1]) return C_ORANGE;
+  if (angle > thresholds[0]) return C_YELLOW;
+  return C_GREEN;
+}
+
+type SegColors = { neck: string; trunk: string; upperArm: string; lowerArm: string; wrist: string; legs: string };
+
+function getSegmentColors(angles: BodyAngles): SegColors {
+  const lowerArmWorst = (a: number) => { const d = Math.abs(a - 80); return d > 50 ? C_RED : d > 30 ? C_ORANGE : d > 15 ? C_YELLOW : C_GREEN; };
+  const scores = [C_GREEN, C_YELLOW, C_ORANGE, C_RED];
+  const li = scores.indexOf(lowerArmWorst(angles.leftLowerArm));
+  const ri = scores.indexOf(lowerArmWorst(angles.rightLowerArm));
+  const knee = Math.min(angles.leftKnee, angles.rightKnee);
+  return {
+    neck:     angleToColor(Math.abs(angles.neckFlexion),   [10, 20, 30]),
+    trunk:    angleToColor(Math.abs(angles.trunkFlexion),  [5,  20, 60]),
+    upperArm: angleToColor(Math.max(angles.leftUpperArm, angles.rightUpperArm), [20, 45, 90]),
+    lowerArm: scores[Math.max(li, ri)],
+    wrist:    angleToColor(Math.max(angles.leftWrist, angles.rightWrist), [8, 15, 30]),
+    legs:     knee < 90 ? C_RED : knee < 120 ? C_ORANGE : knee < 150 ? C_YELLOW : C_GREEN,
+  };
+}
+
+type Seg = keyof SegColors;
+interface Conn { a: number; b: number; seg: Seg }
+const REPLAY_CONNECTIONS: Conn[] = [
+  { a:0,  b:11, seg:'neck' },   { a:0,  b:12, seg:'neck' },
+  { a:11, b:12, seg:'trunk' },  { a:11, b:23, seg:'trunk' },
+  { a:12, b:24, seg:'trunk' },  { a:23, b:24, seg:'trunk' },
+  { a:11, b:13, seg:'upperArm' }, { a:12, b:14, seg:'upperArm' },
+  { a:13, b:15, seg:'lowerArm' }, { a:14, b:16, seg:'lowerArm' },
+  { a:15, b:17, seg:'wrist' },  { a:15, b:19, seg:'wrist' },
+  { a:17, b:19, seg:'wrist' },  { a:16, b:18, seg:'wrist' },
+  { a:16, b:20, seg:'wrist' },  { a:18, b:20, seg:'wrist' },
+  { a:23, b:25, seg:'legs' },   { a:25, b:27, seg:'legs' },
+  { a:24, b:26, seg:'legs' },   { a:26, b:28, seg:'legs' },
+];
+const REPLAY_JOINT_SEG: Record<number, Seg> = {
+  0:'neck',1:'neck',2:'neck',3:'neck',4:'neck',5:'neck',6:'neck',7:'neck',8:'neck',9:'neck',10:'neck',
+  11:'trunk',12:'trunk',
+  13:'upperArm',14:'upperArm',
+  15:'lowerArm',16:'lowerArm',
+  17:'wrist',18:'wrist',19:'wrist',20:'wrist',21:'wrist',22:'wrist',
+  23:'trunk',24:'trunk',
+  25:'legs',26:'legs',27:'legs',28:'legs',29:'legs',30:'legs',31:'legs',32:'legs',
+};
+
+function drawReplayFrame(
+  ctx: CanvasRenderingContext2D,
+  W: number, H: number,
+  video: HTMLVideoElement,
+  landmarks: any[],
+  riskColors: boolean,
+  segColors: SegColors | null,
+) {
+  const vW = video.videoWidth  || W;
+  const vH = video.videoHeight || H;
+  const scale = Math.min(W / vW, H / vH);
+  const drawW = vW * scale;
+  const drawH = vH * scale;
+  const drawX = (W - drawW) / 2;
+  const drawY = (H - drawH) / 2;
+
+  // Draw video frame with correct aspect ratio
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  try { ctx.drawImage(video, drawX, drawY, drawW, drawH); } catch { /* not ready */ }
+
+  const CONF = 0.25;
+  const lw = Math.min(2, Math.max(1.5, drawW / 400));
+  const jr = Math.min(2.5, Math.max(2, drawW / 250));
+
+  const px = (nx: number) => drawX + nx * drawW;
+  const py = (ny: number) => drawY + ny * drawH;
+
+  ctx.lineWidth = lw;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  for (const conn of REPLAY_CONNECTIONS) {
+    const la = landmarks[conn.a];
+    const lb = landmarks[conn.b];
+    if (!la || !lb) continue;
+    if ((la.visibility ?? 1) < CONF || (lb.visibility ?? 1) < CONF) continue;
+    ctx.beginPath();
+    ctx.moveTo(px(la.x), py(la.y));
+    ctx.lineTo(px(lb.x), py(lb.y));
+    ctx.strokeStyle = (riskColors && segColors) ? segColors[conn.seg] : CYAN;
+    ctx.stroke();
+  }
+
+  for (let i = 0; i < landmarks.length; i++) {
+    const pt = landmarks[i];
+    if (!pt || (pt.visibility ?? 1) < CONF) continue;
+    const seg = REPLAY_JOINT_SEG[i] ?? 'trunk';
+    ctx.beginPath();
+    ctx.arc(px(pt.x), py(pt.y), jr, 0, Math.PI * 2);
+    ctx.fillStyle = (riskColors && segColors) ? segColors[seg] : CYAN;
+    ctx.fill();
+  }
+}
+
 function VideoReplay({ session }: { session: SessionRecord }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
+  const rVFCRef = useRef<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [riskColors, setRiskColors] = useState(false);
+  const riskColorsRef = useRef(false);
+  useEffect(() => { riskColorsRef.current = riskColors; }, [riskColors]);
 
   const videoUrl = (session as any).videoUrl as string | undefined;
   const snapshots = session.snapshots;
@@ -238,52 +353,93 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     );
   }, [snapshots]);
 
+  // Size canvas buffer once on mount (not every frame)
+  const sizeCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const W = rect.width  > 10 ? rect.width  : 640;
+    const H = rect.height > 10 ? rect.height : 360;
+    if (canvas.width !== Math.round(W) || canvas.height !== Math.round(H)) {
+      canvas.width  = Math.round(W);
+      canvas.height = Math.round(H);
+    }
+  }, []);
+
   const drawFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
-    // Use the canvas element's rendered size (always valid since canvas is always in DOM)
-    const canvasRect = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const W = canvasRect.width  > 10 ? canvasRect.width  : 800;
-    const H = canvasRect.height > 10 ? canvasRect.height : 450;
-    canvas.width  = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.drawImage(video, 0, 0, W, H);
+    const W = canvas.width;
+    const H = canvas.height;
+    if (W < 4 || H < 4) return;
+
     const snap = nearestSnap(video.currentTime);
-    if (snap?.landmarks?.length) {
-      drawSkeleton({ landmarks: snap.landmarks, scores: { rula: snap.rula.score, reba: snap.reba.score }, canvas, displayWidth: W, displayHeight: H });
+    const lm = snap?.landmarks ?? null;
+    let segColors: SegColors | null = null;
+    if (lm && snap) {
+      try {
+        const { angles } = extractAngles(lm);
+        segColors = getSegmentColors(angles);
+      } catch { /* skip */ }
     }
+
+    drawReplayFrame(ctx, W, H, video, lm ?? [], riskColorsRef.current, segColors);
     setCurrentTime(video.currentTime);
-    if (!video.paused && !video.ended) rafRef.current = requestAnimationFrame(drawFrame);
+
+    if (!video.paused && !video.ended) {
+      if ('requestVideoFrameCallback' in video) {
+        rVFCRef.current = (video as any).requestVideoFrameCallback(() => drawFrame());
+      } else {
+        rafRef.current = requestAnimationFrame(drawFrame);
+      }
+    }
   }, [nearestSnap]);
+
+  const stopLoop = useCallback(() => {
+    cancelAnimationFrame(rafRef.current);
+    const v = videoRef.current;
+    if (v && rVFCRef.current !== null && 'cancelVideoFrameCallback' in v) {
+      (v as any).cancelVideoFrameCallback(rVFCRef.current);
+      rVFCRef.current = null;
+    }
+  }, []);
+
+  const startLoop = useCallback(() => {
+    stopLoop();
+    if ('requestVideoFrameCallback' in (videoRef.current ?? {})) {
+      rVFCRef.current = (videoRef.current as any).requestVideoFrameCallback(() => drawFrame());
+    } else {
+      rafRef.current = requestAnimationFrame(drawFrame);
+    }
+  }, [drawFrame, stopLoop]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
-    if (v.paused) { v.play(); setPlaying(true); rafRef.current = requestAnimationFrame(drawFrame); }
-    else { v.pause(); setPlaying(false); cancelAnimationFrame(rafRef.current); }
-  }, [drawFrame]);
+    if (v.paused) { v.play(); setPlaying(true); startLoop(); }
+    else { v.pause(); setPlaying(false); stopLoop(); }
+  }, [startLoop, stopLoop]);
 
   const restart = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
-    v.pause(); v.currentTime = 0; setPlaying(false); cancelAnimationFrame(rafRef.current);
-    setTimeout(() => drawFrame(), 150);
-  }, [drawFrame]);
+    stopLoop();
+    v.pause(); v.currentTime = 0; setPlaying(false);
+    setTimeout(() => { sizeCanvas(); drawFrame(); }, 100);
+  }, [drawFrame, stopLoop, sizeCanvas]);
 
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    const onMeta = () => { setDuration(v.duration); setTimeout(() => drawFrame(), 200); };
-    const onEnd = () => { setPlaying(false); cancelAnimationFrame(rafRef.current); };
+    const onMeta = () => { setDuration(v.duration); sizeCanvas(); setTimeout(() => drawFrame(), 100); };
+    const onEnd = () => { setPlaying(false); stopLoop(); };
     v.addEventListener('loadedmetadata', onMeta);
     v.addEventListener('ended', onEnd);
-    return () => { v.removeEventListener('loadedmetadata', onMeta); v.removeEventListener('ended', onEnd); cancelAnimationFrame(rafRef.current); };
-  }, [drawFrame]);
+    return () => { v.removeEventListener('loadedmetadata', onMeta); v.removeEventListener('ended', onEnd); stopLoop(); };
+  }, [drawFrame, stopLoop, sizeCanvas]);
 
   if (!videoUrl) {
     return (
@@ -312,8 +468,9 @@ function VideoReplay({ session }: { session: SessionRecord }) {
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
-          <video ref={videoRef} src={videoUrl} className="absolute inset-0 w-full h-full object-contain opacity-0 pointer-events-none" muted preload="auto" playsInline />
-          <canvas ref={canvasRef} className="absolute inset-0 w-full h-full object-contain" />
+          {/* Video is hidden — canvas draws the video frame + skeleton */}
+          <video ref={videoRef} src={videoUrl} className="absolute inset-0 w-full h-full" style={{ opacity: 0, pointerEvents: 'none' }} muted preload="auto" playsInline />
+          <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ display: 'block' }} />
           <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-4 py-3">
             <div className="flex items-center gap-3">
               <button onClick={togglePlay} className="w-8 h-8 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center transition-colors">
@@ -330,11 +487,27 @@ function VideoReplay({ session }: { session: SessionRecord }) {
             </div>
           </div>
         </div>
-        <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
-          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-green-500 inline-block" /> Safe posture</span>
-          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-amber-400 inline-block" /> Caution</span>
-          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-red-500 inline-block" /> High risk</span>
-          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-slate-300 inline-block" /> Low confidence</span>
+        <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
+          <button
+            onClick={() => setRiskColors(v => !v)}
+            className={`px-2.5 py-1 rounded-full border text-xs font-medium transition-colors ${
+              riskColors
+                ? 'bg-sky-50 border-sky-300 text-sky-700'
+                : 'bg-slate-50 border-slate-200 text-slate-500 hover:border-slate-300'
+            }`}
+          >
+            {riskColors ? '● Risk colors ON' : '○ Risk colors OFF'}
+          </button>
+          {riskColors ? (
+            <>
+              <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-green-500 inline-block" /> Safe</span>
+              <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-yellow-400 inline-block" /> Caution</span>
+              <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-orange-500 inline-block" /> Risk</span>
+              <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-red-500 inline-block" /> Danger</span>
+            </>
+          ) : (
+            <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-sky-400 inline-block" /> Skeleton overlay (cyan)</span>
+          )}
         </div>
       </CardContent>
     </Card>
@@ -466,10 +639,16 @@ export default function SessionReport() {
     );
   }
 
-  // Timeline data
+  // Timeline data — use numeric index as X so flat-timestamp sessions still show a trend
   const step = Math.max(1, Math.floor(session.snapshots.length / 60));
-  const chartData = session.snapshots.filter((_, i) => i % step === 0).map((s, i) => ({
-    t: `${Math.round(s.timestamp / 1000)}s`,
+  const filteredSnaps = session.snapshots.filter((_, i) => i % step === 0);
+  // Determine if timestamps are meaningful (spread > 1s)
+  const tSpread = filteredSnaps.length > 1
+    ? (filteredSnaps[filteredSnaps.length - 1].timestamp - filteredSnaps[0].timestamp) / 1000
+    : 0;
+  const useTimestamps = tSpread > 1;
+  const chartData = filteredSnaps.map((s, i) => ({
+    t: useTimestamps ? Math.round(s.timestamp / 1000) : i,
     RULA: Math.round(s.rula.score * 10) / 10,
     REBA: Math.round(s.reba.score * 10) / 10,
     Overall: Math.round(s.overallScore * 10) / 10,
@@ -653,7 +832,7 @@ export default function SessionReport() {
             <ResponsiveContainer width="100%" height={220}>
               <LineChart data={chartData} margin={{ left: 0, right: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                <XAxis dataKey="t" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
+                <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} tickFormatter={v => useTimestamps ? `${v}s` : `#${v + 1}`} tick={{ fontSize: 10 }} interval="preserveStartEnd" />
                 <YAxis domain={[0, 15]} tick={{ fontSize: 10 }} />
                 <ReTooltip contentStyle={{ fontSize: 12 }} />
                 <ReferenceLine y={7} stroke="#ef4444" strokeDasharray="4 2" label={{ value: 'RULA High', fontSize: 10, fill: '#ef4444' }} />
