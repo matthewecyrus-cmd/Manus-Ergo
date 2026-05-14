@@ -3,15 +3,14 @@
  * =====================
  * Design: Clinical Dashboard — deep navy sidebar, sky-blue accents, ISO risk colors
  *
- * Key fixes in this version:
- *   1. MediaPipe uses IMAGE mode (detect) for frame-by-frame analysis, not VIDEO mode.
- *      VIDEO mode requires a continuously playing video stream; IMAGE mode works on
- *      seeked frames. Confidence thresholds lowered to 0.3 for side-angle shots.
- *   2. Canvas is sized to the VIDEO ELEMENT's displayed pixel dimensions (getBoundingClientRect),
- *      NOT the natural video resolution. Landmark coordinates (0-1 normalized) are then
- *      multiplied by the displayed size, so joints map correctly onto the visible person.
- *   3. Analyze button is pinned at the TOP of the right column, always visible above the fold.
- *   4. Configuration panel is collapsible to keep the UI compact.
+ * CRITICAL FIX — Skeleton overlay coordinate math:
+ *   The canvas is always visible (not display:none) so getBoundingClientRect() returns
+ *   real dimensions. The canvas buffer is sized to the canvas element's rendered pixel
+ *   dimensions (DPR-aware). Landmark coords (0–1 normalized) are multiplied by those
+ *   dimensions, so joints land precisely on the person's body.
+ *
+ *   The video element uses opacity:0 + position:absolute during analysis (NOT display:none)
+ *   so it stays in the layout flow and the canvas can overlay it correctly.
  */
 import { useRef, useState, useCallback, useEffect, useContext } from 'react';
 import { useLocation } from 'wouter';
@@ -37,12 +36,16 @@ import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord } from '@/
 
 // MediaPipe CDN
 const MEDIAPIPE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
-// Use the full model for better side-angle detection
 const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
 
 type AnalysisState = 'idle' | 'loading-model' | 'analyzing' | 'done' | 'error';
 
-// ─── Skeleton drawing (inline, sized to displayed element) ────────────────────
+// ─── Per-joint risk coloring ────────────────────────────────────────────────
+// Joint indices that contribute to upper-limb risk (RULA-sensitive)
+const UPPER_JOINTS = new Set([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+// Joint indices that contribute to trunk/lower-body risk (REBA-sensitive)
+const LOWER_JOINTS = new Set([23, 24, 25, 26, 27, 28, 29, 30, 31, 32]);
+
 const POSE_CONNECTIONS: [number, number][] = [
   [11, 12], [11, 23], [12, 24], [23, 24],
   [11, 13], [13, 15],
@@ -54,83 +57,108 @@ const POSE_CONNECTIONS: [number, number][] = [
   [0, 11], [0, 12],
 ];
 
-const RISK_COLORS: Record<string, string> = {
-  low: '#22c55e',
-  medium: '#f59e0b',
-  high: '#ef4444',
-  'very-high': '#dc2626',
-};
+function riskColor(score: number, type: 'rula' | 'reba'): string {
+  if (type === 'rula') {
+    if (score >= 7) return '#ef4444';
+    if (score >= 5) return '#f97316';
+    if (score >= 3) return '#f59e0b';
+    return '#22c55e';
+  } else {
+    if (score >= 11) return '#ef4444';
+    if (score >= 8)  return '#f97316';
+    if (score >= 4)  return '#f59e0b';
+    return '#22c55e';
+  }
+}
 
-function drawSkeletonOnCanvas(
+function drawSkeleton(
   canvas: HTMLCanvasElement,
   lm: any[],
   scores: { rula: number; reba: number } | null,
-  displayW: number,
-  displayH: number,
 ) {
-  canvas.width = displayW;
-  canvas.height = displayH;
+  // Use the canvas element's RENDERED pixel size (not its buffer size)
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const W = rect.width;
+  const H = rect.height;
+
+  if (W === 0 || H === 0) return;
+
+  // Size the canvas buffer to the rendered size × DPR for sharp rendering
+  if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+    canvas.width  = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+  }
+
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
-  ctx.clearRect(0, 0, displayW, displayH);
 
-  const CONF = 0.3; // lowered threshold for side-angle shots
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
 
-  const riskLevel = scores
-    ? scores.rula >= 7 || scores.reba >= 11 ? 'very-high'
-      : scores.rula >= 5 || scores.reba >= 8 ? 'high'
-      : scores.rula >= 3 || scores.reba >= 4 ? 'medium'
-      : 'low'
-    : 'low';
-  const boneColor = RISK_COLORS[riskLevel] ?? '#22d3ee';
+  const CONF = 0.25;
+  const rulaColor = scores ? riskColor(scores.rula, 'rula') : '#22c55e';
+  const rebaColor = scores ? riskColor(scores.reba, 'reba') : '#22c55e';
 
-  // Draw bones
-  ctx.lineWidth = Math.max(2, displayW / 320);
+  // ── Draw bones ──────────────────────────────────────────────────────────
+  ctx.lineWidth = Math.max(2.5, W / 280);
   for (const [a, b] of POSE_CONNECTIONS) {
     const la = lm[a], lb = lm[b];
     if (!la || !lb) continue;
     if ((la.visibility ?? 1) < CONF || (lb.visibility ?? 1) < CONF) continue;
+
+    const isUpper = UPPER_JOINTS.has(a) || UPPER_JOINTS.has(b);
+    const color = isUpper ? rulaColor : rebaColor;
+
     ctx.beginPath();
-    ctx.moveTo(la.x * displayW, la.y * displayH);
-    ctx.lineTo(lb.x * displayW, lb.y * displayH);
-    ctx.strokeStyle = boneColor + 'cc';
+    ctx.moveTo(la.x * W, la.y * H);
+    ctx.lineTo(lb.x * W, lb.y * H);
+    ctx.strokeStyle = color + 'cc';
     ctx.stroke();
   }
 
-  // Draw joints
-  const r = Math.max(4, displayW / 160);
+  // ── Draw joints ─────────────────────────────────────────────────────────
+  const r = Math.max(5, W / 120);
   for (let i = 0; i < lm.length; i++) {
     const pt = lm[i];
     if (!pt || (pt.visibility ?? 1) < CONF) continue;
-    const x = pt.x * displayW;
-    const y = pt.y * displayH;
 
-    // Glow ring
+    const x = pt.x * W;
+    const y = pt.y * H;
+    const isUpper = UPPER_JOINTS.has(i);
+    const color = isUpper ? rulaColor : rebaColor;
+
+    // Glow halo
     ctx.beginPath();
-    ctx.arc(x, y, r * 1.8, 0, Math.PI * 2);
-    ctx.fillStyle = boneColor + '33';
+    ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
+    ctx.fillStyle = color + '28';
     ctx.fill();
 
-    // Solid dot
+    // White outline ring
+    ctx.beginPath();
+    ctx.arc(x, y, r + 1.5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fill();
+
+    // Colored fill
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fillStyle = boneColor;
+    ctx.fillStyle = color;
     ctx.fill();
   }
 
-  // Score badge top-left
+  // ── Score badge ─────────────────────────────────────────────────────────
   if (scores) {
-    const badgeW = 110;
-    const badgeH = 36;
-    const pad = 8;
-    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    const pad = 10;
+    const bW = 130, bH = 38;
+    ctx.fillStyle = 'rgba(0,0,0,0.72)';
     ctx.beginPath();
-    ctx.roundRect(pad, pad, badgeW, badgeH, 6);
+    ctx.roundRect(pad, pad, bW, bH, 7);
     ctx.fill();
-    ctx.font = `bold ${Math.max(11, displayW / 60)}px monospace`;
+    ctx.font = `bold ${Math.max(12, W / 55)}px ui-monospace, monospace`;
     ctx.fillStyle = '#fff';
     ctx.textAlign = 'left';
-    ctx.fillText(`RULA ${scores.rula.toFixed(0)}  REBA ${scores.reba.toFixed(0)}`, pad + 8, pad + 23);
+    ctx.fillText(`RULA ${scores.rula.toFixed(0)}   REBA ${scores.reba.toFixed(0)}`, pad + 10, pad + 25);
   }
 }
 
@@ -138,33 +166,25 @@ export default function VideoUpload() {
   const [, navigate] = useLocation();
   const { sessions, taskProfile, setTaskProfile } = useSession();
 
-  // File state
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
-  // Analysis state
   const [analysisState, setAnalysisState] = useState<AnalysisState>('idle');
   const [progress, setProgress] = useState(0);
   const [framesProcessed, setFramesProcessed] = useState(0);
   const [totalFrames, setTotalFrames] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [resultId, setResultId] = useState<string | null>(null);
+  const [liveScores, setLiveScores] = useState<{ rula: number; reba: number } | null>(null);
 
-  // Metadata
   const [assessor, setAssessor] = useState('');
   const [department, setDepartment] = useState('');
   const [location, setLocation] = useState('');
   const [notes, setNotes] = useState('');
   const [baselineId, setBaselineId] = useState('');
-
-  // Live overlay state
-  const [liveScores, setLiveScores] = useState<{ rula: number; reba: number } | null>(null);
-
-  // UI state
   const [configOpen, setConfigOpen] = useState(true);
 
-  // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const poseLandmarkerRef = useRef<any>(null);
@@ -173,7 +193,6 @@ export default function VideoUpload() {
 
   useEffect(() => { taskProfileRef.current = taskProfile; }, [taskProfile]);
 
-  // ─── FILE HANDLING ─────────────────────────────────────────────────────────
   const handleFile = useCallback((file: File) => {
     if (!file.type.startsWith('video/')) {
       toast.error('Please upload a video file (mp4, mov, webm, avi).');
@@ -203,41 +222,30 @@ export default function VideoUpload() {
     if (file) handleFile(file);
   }, [handleFile]);
 
-  // ─── MODEL LOADER ──────────────────────────────────────────────────────────
-  // Use IMAGE running mode for frame-by-frame seeked analysis
   const loadModel = useCallback(async () => {
     if (poseLandmarkerRef.current) return;
     const { PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
     const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_CDN);
-    // Try GPU first, fall back to CPU
+    const opts = {
+      baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' as const },
+      runningMode: 'IMAGE' as const,
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.25,
+      minPosePresenceConfidence: 0.25,
+      minTrackingConfidence: 0.25,
+    };
     try {
-      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
-        runningMode: 'IMAGE',
-        numPoses: 1,
-        minPoseDetectionConfidence: 0.3,
-        minPosePresenceConfidence: 0.3,
-        minTrackingConfidence: 0.3,
-      });
+      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, opts);
     } catch {
-      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
-        runningMode: 'IMAGE',
-        numPoses: 1,
-        minPoseDetectionConfidence: 0.3,
-        minPosePresenceConfidence: 0.3,
-        minTrackingConfidence: 0.3,
-      });
+      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(vision, { ...opts, baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' as const } });
     }
   }, []);
 
-  // ─── SESSION ADDER ─────────────────────────────────────────────────────────
   const ctx = useContext(SessionContext);
   const addSession = useCallback((record: SessionRecord) => {
     if (ctx) ctx.addSession(record);
   }, [ctx]);
 
-  // ─── FRAME ANALYSIS ────────────────────────────────────────────────────────
   const analyzeVideo = useCallback(async () => {
     if (!videoFile || !videoUrl) return;
     setAnalysisState('loading-model');
@@ -246,7 +254,7 @@ export default function VideoUpload() {
 
     try {
       await loadModel();
-    } catch (err: any) {
+    } catch {
       setErrorMsg('Failed to load pose detection model. Check your internet connection.');
       setAnalysisState('error');
       return;
@@ -256,7 +264,6 @@ export default function VideoUpload() {
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
-    // Load video metadata
     video.src = videoUrl;
     video.muted = true;
     video.crossOrigin = 'anonymous';
@@ -268,7 +275,6 @@ export default function VideoUpload() {
     });
 
     const duration = video.duration;
-    // Sample every 0.5s; for long videos cap at 300 frames to keep it fast
     const SAMPLE_INTERVAL = Math.max(0.5, duration / 300);
     const frameCount = Math.floor(duration / SAMPLE_INTERVAL);
     setTotalFrames(frameCount);
@@ -283,29 +289,34 @@ export default function VideoUpload() {
       const t = i * SAMPLE_INTERVAL;
       video.currentTime = t;
 
-      // Wait for seek to complete
       await new Promise<void>(resolve => {
         const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
         video.addEventListener('seeked', onSeeked);
       });
 
-      // Get the displayed size of the video element for correct coordinate mapping
-      const rect = video.getBoundingClientRect();
-      const displayW = rect.width > 0 ? rect.width : video.clientWidth || 640;
-      const displayH = rect.height > 0 ? rect.height : video.clientHeight || 360;
+      // ── Get canvas rendered dimensions (canvas is always visible, rect is always valid) ──
+      const canvasRect = canvas.getBoundingClientRect();
+      const W = canvasRect.width  > 10 ? canvasRect.width  : 800;
+      const H = canvasRect.height > 10 ? canvasRect.height : 450;
+      const dpr = window.devicePixelRatio || 1;
 
-      // Draw video frame to canvas at displayed size (not natural resolution)
-      canvas.width = displayW;
-      canvas.height = displayH;
+      // Size canvas buffer to rendered size × DPR
+      canvas.width  = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+
       const c2d = canvas.getContext('2d');
-      if (c2d) c2d.drawImage(video, 0, 0, displayW, displayH);
+      if (c2d) {
+        c2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+        // Draw the video frame scaled to fill the canvas display area
+        c2d.drawImage(video, 0, 0, W, H);
+      }
 
       // Capture thumbnail at 25% mark
       if (i === Math.floor(frameCount * 0.25) && c2d) {
         thumbnailDataUrl = canvas.toDataURL('image/jpeg', 0.7);
       }
 
-      // Run MediaPipe detection in IMAGE mode (works on seeked frames)
+      // Run MediaPipe in IMAGE mode (works on seeked frames)
       let result: any;
       try {
         result = poseLandmarkerRef.current.detect(video);
@@ -318,20 +329,21 @@ export default function VideoUpload() {
         const snap = computeSnapshot(smoothed, taskProfileRef.current);
         if (snap) {
           snapshots.push({ ...snap, timestamp: t * 1000, landmarks: smoothed });
-
           const scores = { rula: snap.rula.score, reba: snap.reba.score };
           setLiveScores(scores);
 
-          // Draw video frame + skeleton overlay at displayed size
-          if (c2d) c2d.drawImage(video, 0, 0, displayW, displayH);
-          drawSkeletonOnCanvas(canvas, smoothed, scores, displayW, displayH);
+          // Redraw video frame then overlay skeleton
+          if (c2d) {
+            c2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+            c2d.drawImage(video, 0, 0, W, H);
+          }
+          drawSkeleton(canvas, smoothed, scores);
         }
       }
 
       setFramesProcessed(i + 1);
       setProgress(Math.round(((i + 1) / frameCount) * 100));
 
-      // Yield to browser to keep UI responsive
       if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
     }
 
@@ -344,7 +356,6 @@ export default function VideoUpload() {
       return;
     }
 
-    // Build session record
     const record = summarizeSession(
       snapshots,
       taskProfileRef.current,
@@ -360,7 +371,6 @@ export default function VideoUpload() {
     );
 
     if (baselineId) (record as any).baselineSessionId = baselineId;
-    // Store the object URL so the session report can replay the video with overlay
     (record as any).videoUrl = videoUrl;
 
     addSession(record);
@@ -388,7 +398,7 @@ export default function VideoUpload() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
-        {/* ── Left: Video preview (3/5 width) ────────────────────────────── */}
+        {/* ── Left: Video preview (3/5 width) ──────────────────────────────── */}
         <div className="lg:col-span-3 space-y-3">
           {!videoFile ? (
             <div
@@ -410,7 +420,7 @@ export default function VideoUpload() {
             </div>
           ) : (
             <div className="space-y-3">
-              {/* File info */}
+              {/* File info bar */}
               <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border">
                 <FileVideo className="w-5 h-5 text-sky-500 shrink-0" />
                 <div className="flex-1 min-w-0">
@@ -426,27 +436,47 @@ export default function VideoUpload() {
                 </Button>
               </div>
 
-              {/* Video + canvas overlay container */}
+              {/* ── Video + canvas overlay container ────────────────────────── */}
+              {/*
+                CRITICAL: The video element MUST stay in the DOM and be visible (not display:none)
+                during analysis so that:
+                  1. getBoundingClientRect() on the canvas returns real dimensions
+                  2. MediaPipe can read the video frame via detect(video)
+                We use opacity:0 + absolute positioning to hide it visually while keeping it
+                in layout flow. The canvas sits on top with the video frame drawn onto it.
+              */}
               <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
-                {/* The actual video element — hidden during analysis, shown otherwise */}
+                {/* Video — always in DOM, hidden behind canvas during analysis */}
                 <video
                   ref={videoRef}
                   src={videoUrl ?? undefined}
                   className="w-full h-full object-contain"
-                  style={{ display: isAnalyzing ? 'none' : 'block' }}
+                  style={{
+                    opacity: isAnalyzing ? 0 : 1,
+                    position: isAnalyzing ? 'absolute' : 'relative',
+                    inset: 0,
+                    zIndex: 1,
+                  }}
                   controls={!isAnalyzing}
                   preload="metadata"
                 />
-                {/* Canvas shows video frame + skeleton during analysis */}
+
+                {/* Canvas — always rendered so its rect is always valid */}
                 <canvas
                   ref={canvasRef}
-                  className="absolute inset-0 w-full h-full object-contain"
-                  style={{ display: isAnalyzing ? 'block' : 'none' }}
+                  className="w-full h-full"
+                  style={{
+                    display: isAnalyzing ? 'block' : 'none',
+                    position: 'absolute',
+                    inset: 0,
+                    zIndex: 2,
+                    pointerEvents: 'none',
+                  }}
                 />
 
                 {/* Progress HUD */}
                 {isAnalyzing && (
-                  <div className="absolute bottom-0 left-0 right-0 bg-black/70 px-4 py-2.5 flex items-center gap-4">
+                  <div className="absolute bottom-0 left-0 right-0 bg-black/75 px-4 py-2.5 flex items-center gap-4" style={{ zIndex: 3 }}>
                     <div className="flex-1">
                       <div className="flex justify-between text-xs text-white/80 mb-1">
                         <span>
@@ -495,12 +525,12 @@ export default function VideoUpload() {
           )}
         </div>
 
-        {/* ── Right: Config + Analyze button (2/5 width) ──────────────────── */}
+        {/* ── Right: Analyze button + config (2/5 width) ────────────────────── */}
         <div className="lg:col-span-2 space-y-3">
 
-          {/* ★ ANALYZE BUTTON — pinned at top, always visible ★ */}
+          {/* ★ ANALYZE BUTTON — always at top ★ */}
           <Button
-            className="w-full gap-2 bg-sky-600 hover:bg-sky-700 text-white h-11 text-base font-semibold shadow-md"
+            className="w-full gap-2 bg-sky-600 hover:bg-sky-700 text-white h-12 text-base font-semibold shadow-md"
             disabled={!videoFile || isAnalyzing}
             onClick={analyzeVideo}
           >
@@ -517,7 +547,7 @@ export default function VideoUpload() {
             )}
           </Button>
 
-          {/* Task Configuration — collapsible */}
+          {/* Task Configuration */}
           <Card>
             <CardHeader className="pb-2 cursor-pointer select-none" onClick={() => setConfigOpen(o => !o)}>
               <CardTitle className="text-sm flex items-center justify-between">
@@ -581,7 +611,7 @@ export default function VideoUpload() {
             )}
           </Card>
 
-          {/* Assessment Metadata — collapsible */}
+          {/* Assessment Metadata */}
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm">Assessment Details</CardTitle>
@@ -623,7 +653,7 @@ export default function VideoUpload() {
             <p className="font-semibold text-foreground">Tips for best results</p>
             <p>• Worker should fill at least 30% of the frame</p>
             <p>• Good lighting, avoid strong backlighting</p>
-            <p>• Side or 45° angle works well; avoid directly behind</p>
+            <p>• Side or 45° angle works best; avoid directly behind</p>
             <p>• Full body visible (head to feet) gives most accurate scores</p>
           </div>
         </div>

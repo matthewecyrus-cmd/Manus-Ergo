@@ -242,14 +242,20 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
+    // Use the canvas element's rendered size (always valid since canvas is always in DOM)
+    const canvasRect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvasRect.width  > 10 ? canvasRect.width  : 800;
+    const H = canvasRect.height > 10 ? canvasRect.height : 450;
+    canvas.width  = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.drawImage(video, 0, 0, W, H);
     const snap = nearestSnap(video.currentTime);
     if (snap?.landmarks?.length) {
-      drawSkeleton({ landmarks: snap.landmarks, scores: { rula: snap.rula.score, reba: snap.reba.score }, canvas, videoWidth: canvas.width, videoHeight: canvas.height });
+      drawSkeleton({ landmarks: snap.landmarks, scores: { rula: snap.rula.score, reba: snap.reba.score }, canvas, displayWidth: W, displayHeight: H });
     }
     setCurrentTime(video.currentTime);
     if (!video.paused && !video.ended) rafRef.current = requestAnimationFrame(drawFrame);
