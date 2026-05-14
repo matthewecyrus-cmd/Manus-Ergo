@@ -346,12 +346,38 @@ function VideoReplay({ session }: { session: SessionRecord }) {
   const videoUrl = (session as any).videoUrl as string | undefined;
   const snapshots = session.snapshots;
 
-  const nearestSnap = useCallback((t: number) => {
-    if (!snapshots.length) return null;
-    return snapshots.reduce((best, s) =>
-      Math.abs(s.timestamp / 1000 - t) < Math.abs(best.timestamp / 1000 - t) ? s : best
-    );
-  }, [snapshots]);
+  // Sort snapshots by timestamp once
+  const sortedSnaps = snapshots.slice().sort((a, b) => a.timestamp - b.timestamp);
+
+  // Interpolate landmarks between two adjacent snapshots for smooth overlay
+  const interpolatedLandmarks = useCallback((t: number): { lm: any[]; snap: typeof snapshots[0] } | null => {
+    if (!sortedSnaps.length) return null;
+    const tMs = t * 1000;
+    // Find bracketing pair
+    let lo = 0;
+    for (let i = 0; i < sortedSnaps.length - 1; i++) {
+      if (sortedSnaps[i].timestamp <= tMs) lo = i;
+      else break;
+    }
+    const snapA = sortedSnaps[lo];
+    const snapB = sortedSnaps[Math.min(lo + 1, sortedSnaps.length - 1)];
+    if (snapA === snapB || !snapA.landmarks?.length) return { lm: snapA.landmarks ?? [], snap: snapA };
+    const dt = snapB.timestamp - snapA.timestamp;
+    const alpha = dt > 0 ? Math.min(1, Math.max(0, (tMs - snapA.timestamp) / dt)) : 0;
+    if (alpha <= 0 || !snapB.landmarks?.length) return { lm: snapA.landmarks, snap: snapA };
+    // Lerp each landmark
+    const lm = snapA.landmarks.map((a: any, i: number) => {
+      const b = snapB.landmarks?.[i];
+      if (!b) return a;
+      return {
+        x: a.x + (b.x - a.x) * alpha,
+        y: a.y + (b.y - a.y) * alpha,
+        z: (a.z ?? 0) + ((b.z ?? 0) - (a.z ?? 0)) * alpha,
+        visibility: (a.visibility ?? 1) * (1 - alpha) + (b.visibility ?? 1) * alpha,
+      };
+    });
+    return { lm, snap: alpha < 0.5 ? snapA : snapB };
+  }, [sortedSnaps]);
 
   // Size canvas buffer once on mount (not every frame)
   const sizeCanvas = useCallback(() => {
@@ -376,10 +402,10 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     const H = canvas.height;
     if (W < 4 || H < 4) return;
 
-    const snap = nearestSnap(video.currentTime);
-    const lm = snap?.landmarks ?? null;
+    const interp = interpolatedLandmarks(video.currentTime);
+    const lm = interp?.lm ?? null;
     let segColors: SegColors | null = null;
-    if (lm && snap) {
+    if (lm?.length) {
       try {
         const { angles } = extractAngles(lm);
         segColors = getSegmentColors(angles);
@@ -396,7 +422,7 @@ function VideoReplay({ session }: { session: SessionRecord }) {
         rafRef.current = requestAnimationFrame(drawFrame);
       }
     }
-  }, [nearestSnap]);
+  }, [interpolatedLandmarks]);
 
   const stopLoop = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
