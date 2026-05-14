@@ -255,16 +255,29 @@ function getSegmentColors(angles: BodyAngles): SegColors {
 type Seg = keyof SegColors;
 interface Conn { a: number; b: number; seg: Seg }
 const REPLAY_CONNECTIONS: Conn[] = [
-  { a:0,  b:11, seg:'neck' },   { a:0,  b:12, seg:'neck' },
-  { a:11, b:12, seg:'trunk' },  { a:11, b:23, seg:'trunk' },
-  { a:12, b:24, seg:'trunk' },  { a:23, b:24, seg:'trunk' },
+  // Head / neck
+  { a:0,  b:1,  seg:'neck' }, { a:1,  b:2,  seg:'neck' }, { a:2,  b:3,  seg:'neck' }, { a:3,  b:7,  seg:'neck' },
+  { a:0,  b:4,  seg:'neck' }, { a:4,  b:5,  seg:'neck' }, { a:5,  b:6,  seg:'neck' }, { a:6,  b:8,  seg:'neck' },
+  { a:9,  b:10, seg:'neck' },
+  // Shoulders to ears
+  { a:11, b:7,  seg:'neck' }, { a:12, b:8,  seg:'neck' },
+  // Torso
+  { a:11, b:12, seg:'trunk' }, { a:11, b:23, seg:'trunk' },
+  { a:12, b:24, seg:'trunk' }, { a:23, b:24, seg:'trunk' },
+  // Upper arms
   { a:11, b:13, seg:'upperArm' }, { a:12, b:14, seg:'upperArm' },
+  // Lower arms
   { a:13, b:15, seg:'lowerArm' }, { a:14, b:16, seg:'lowerArm' },
-  { a:15, b:17, seg:'wrist' },  { a:15, b:19, seg:'wrist' },
-  { a:17, b:19, seg:'wrist' },  { a:16, b:18, seg:'wrist' },
-  { a:16, b:20, seg:'wrist' },  { a:18, b:20, seg:'wrist' },
-  { a:23, b:25, seg:'legs' },   { a:25, b:27, seg:'legs' },
-  { a:24, b:26, seg:'legs' },   { a:26, b:28, seg:'legs' },
+  // Wrists / hands
+  { a:15, b:17, seg:'wrist' }, { a:15, b:19, seg:'wrist' }, { a:17, b:19, seg:'wrist' },
+  { a:16, b:18, seg:'wrist' }, { a:16, b:20, seg:'wrist' }, { a:18, b:20, seg:'wrist' },
+  // Legs
+  { a:23, b:25, seg:'legs' }, { a:25, b:27, seg:'legs' },
+  { a:24, b:26, seg:'legs' }, { a:26, b:28, seg:'legs' },
+  // Feet
+  { a:27, b:29, seg:'legs' }, { a:28, b:30, seg:'legs' },
+  { a:27, b:31, seg:'legs' }, { a:28, b:32, seg:'legs' },
+  { a:29, b:31, seg:'legs' }, { a:30, b:32, seg:'legs' },
 ];
 const REPLAY_JOINT_SEG: Record<number, Seg> = {
   0:'neck',1:'neck',2:'neck',3:'neck',4:'neck',5:'neck',6:'neck',7:'neck',8:'neck',9:'neck',10:'neck',
@@ -339,9 +352,8 @@ function VideoReplay({ session }: { session: SessionRecord }) {
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [riskColors, setRiskColors] = useState(false);
-  const riskColorsRef = useRef(false);
-  useEffect(() => { riskColorsRef.current = riskColors; }, [riskColors]);
+  // Risk colors always active — no toggle needed
+  const riskColorsRef = useRef(true);
 
   const videoUrl = (session as any).videoUrl as string | undefined;
   const snapshots = session.snapshots;
@@ -392,6 +404,10 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     }
   }, []);
 
+  // drawFrame uses only refs — no state deps — so the rVFC loop never dies
+  const interpolatedLandmarksRef = useRef(interpolatedLandmarks);
+  useEffect(() => { interpolatedLandmarksRef.current = interpolatedLandmarks; }, [interpolatedLandmarks]);
+
   const drawFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -402,7 +418,7 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     const H = canvas.height;
     if (W < 4 || H < 4) return;
 
-    const interp = interpolatedLandmarks(video.currentTime);
+    const interp = interpolatedLandmarksRef.current(video.currentTime);
     const lm = interp?.lm ?? null;
     let segColors: SegColors | null = null;
     if (lm?.length) {
@@ -412,7 +428,7 @@ function VideoReplay({ session }: { session: SessionRecord }) {
       } catch { /* skip */ }
     }
 
-    drawReplayFrame(ctx, W, H, video, lm ?? [], riskColorsRef.current, segColors);
+    drawReplayFrame(ctx, W, H, video, lm ?? [], true, segColors);
     setCurrentTime(video.currentTime);
 
     if (!video.paused && !video.ended) {
@@ -422,7 +438,7 @@ function VideoReplay({ session }: { session: SessionRecord }) {
         rafRef.current = requestAnimationFrame(drawFrame);
       }
     }
-  }, [interpolatedLandmarks]);
+  }, []); // stable — no state deps, uses only refs
 
   const stopLoop = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -514,26 +530,10 @@ function VideoReplay({ session }: { session: SessionRecord }) {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
-          <button
-            onClick={() => setRiskColors(v => !v)}
-            className={`px-2.5 py-1 rounded-full border text-xs font-medium transition-colors ${
-              riskColors
-                ? 'bg-sky-50 border-sky-300 text-sky-700'
-                : 'bg-slate-50 border-slate-200 text-slate-500 hover:border-slate-300'
-            }`}
-          >
-            {riskColors ? '● Risk colors ON' : '○ Risk colors OFF'}
-          </button>
-          {riskColors ? (
-            <>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-green-500 inline-block" /> Safe</span>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-yellow-400 inline-block" /> Caution</span>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-orange-500 inline-block" /> Risk</span>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-red-500 inline-block" /> Danger</span>
-            </>
-          ) : (
-            <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-sky-400 inline-block" /> Skeleton overlay (cyan)</span>
-          )}
+          <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-green-500 inline-block" /> Safe</span>
+          <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-yellow-400 inline-block" /> Caution</span>
+          <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-orange-500 inline-block" /> Risk</span>
+          <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-red-500 inline-block" /> Danger</span>
         </div>
       </CardContent>
     </Card>
@@ -665,20 +665,22 @@ export default function SessionReport() {
     );
   }
 
-  // Timeline data — use numeric index as X so flat-timestamp sessions still show a trend
-  const step = Math.max(1, Math.floor(session.snapshots.length / 60));
+  // Timeline data — use continuous joint angles (vary per frame) not stepped RULA/REBA integers
+  const step = Math.max(1, Math.floor(session.snapshots.length / 80));
   const filteredSnaps = session.snapshots.filter((_, i) => i % step === 0);
-  // Determine if timestamps are meaningful (spread > 1s)
   const tSpread = filteredSnaps.length > 1
     ? (filteredSnaps[filteredSnaps.length - 1].timestamp - filteredSnaps[0].timestamp) / 1000
     : 0;
   const useTimestamps = tSpread > 1;
-  const chartData = filteredSnaps.map((s, i) => ({
-    t: useTimestamps ? Math.round(s.timestamp / 1000) : i,
-    RULA: Math.round(s.rula.score * 10) / 10,
-    REBA: Math.round(s.reba.score * 10) / 10,
-    Overall: Math.round(s.overallScore * 10) / 10,
-  }));
+  const chartData = filteredSnaps.map((s, i) => {
+    const t = useTimestamps ? Math.round(s.timestamp / 1000) : i;
+    // Use raw angles for continuous variation; fall back to score if angles missing
+    const neck   = s.angles ? Math.round(Math.abs(s.angles.neckFlexion) * 10) / 10 : s.rula.score;
+    const trunk  = s.angles ? Math.round(Math.abs(s.angles.trunkFlexion) * 10) / 10 : s.reba.score;
+    const rShoulder = s.angles ? Math.round(s.angles.rightUpperArm * 10) / 10 : s.rula.score;
+    const lShoulder = s.angles ? Math.round(s.angles.leftUpperArm  * 10) / 10 : s.rula.score;
+    return { t, Neck: neck, Trunk: trunk, 'R.Shoulder': rShoulder, 'L.Shoulder': lShoulder };
+  });
 
   // Body regions
   const bodyRegions = session.bodyRegions?.length ? session.bodyRegions : buildBodyRegions(session.snapshots);
@@ -856,17 +858,18 @@ export default function SessionReport() {
           </CardHeader>
           <CardContent>
             <ResponsiveContainer width="100%" height={220}>
-              <LineChart data={chartData} margin={{ left: 0, right: 10 }}>
+              <LineChart data={chartData} margin={{ left: 0, right: 10, top: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
                 <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} tickFormatter={v => useTimestamps ? `${v}s` : `#${v + 1}`} tick={{ fontSize: 10 }} interval="preserveStartEnd" />
-                <YAxis domain={[0, 15]} tick={{ fontSize: 10 }} />
-                <ReTooltip contentStyle={{ fontSize: 12 }} />
-                <ReferenceLine y={7} stroke="#ef4444" strokeDasharray="4 2" label={{ value: 'RULA High', fontSize: 10, fill: '#ef4444' }} />
-                <ReferenceLine y={8} stroke="#f97316" strokeDasharray="4 2" label={{ value: 'REBA High', fontSize: 10, fill: '#f97316' }} />
-                <ReferenceLine y={5} stroke="#f59e0b" strokeDasharray="4 2" label={{ value: 'RULA Action', fontSize: 10, fill: '#f59e0b' }} />
-                <Line type="monotone" dataKey="RULA" stroke="#3b82f6" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="REBA" stroke="#f59e0b" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="Overall" stroke="#8b5cf6" strokeWidth={1.5} dot={false} strokeDasharray="4 2" />
+                <YAxis domain={[0, 'auto']} tick={{ fontSize: 10 }} unit="°" />
+                <ReTooltip contentStyle={{ fontSize: 12 }} formatter={(v: number, name: string) => [`${v}°`, name]} />
+                {/* Safe-range reference lines */}
+                <ReferenceLine y={20} stroke="#f59e0b" strokeDasharray="4 2" label={{ value: 'Neck safe limit', fontSize: 9, fill: '#f59e0b', position: 'insideTopRight' }} />
+                <ReferenceLine y={45} stroke="#ef4444" strokeDasharray="4 2" label={{ value: 'Shoulder risk', fontSize: 9, fill: '#ef4444', position: 'insideTopRight' }} />
+                <Line type="monotone" dataKey="Neck" stroke="#06b6d4" strokeWidth={1.5} dot={false} />
+                <Line type="monotone" dataKey="Trunk" stroke="#8b5cf6" strokeWidth={1.5} dot={false} />
+                <Line type="monotone" dataKey="R.Shoulder" stroke="#f97316" strokeWidth={1.5} dot={false} />
+                <Line type="monotone" dataKey="L.Shoulder" stroke="#22c55e" strokeWidth={1.5} dot={false} />
               </LineChart>
             </ResponsiveContainer>
           </CardContent>
