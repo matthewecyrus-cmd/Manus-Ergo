@@ -81,6 +81,12 @@ export interface BodyAngles {
   leftKnee: number;
   rightKnee: number;
   hipFlexion: number;
+  /** Shoulder abduction — arm raised out to the side (degrees). RULA/REBA +1 penalty ≥45°. */
+  leftShoulderAbduction: number;
+  rightShoulderAbduction: number;
+  /** Forearm crossing midline — positive = arm crosses body center. RULA lower-arm +1 penalty. */
+  leftForearmCross: number;
+  rightForearmCross: number;
 }
 
 export interface TaskProfile {
@@ -237,13 +243,21 @@ function gatedAngle(
   };
 }
 
+// ─── HOLD-LAST-VALID ANGLE STATE ─────────────────────────────────────────────
+// When a joint drops below the visibility threshold we return the previous
+// valid value instead of 0°. This eliminates the "all-green flash" on occlusion.
+let _lastValidAngles: BodyAngles | null = null;
+/** Reset hold-last-valid state (call when starting a new session). */
+export function resetAngleState() { _lastValidAngles = null; }
+
 // ─── BODY ANGLE EXTRACTION ───────────────────────────────────────────────────
 export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidence: number } {
   const frame = torsoFrame(lm);
+  const prev = _lastValidAngles;
 
-  function safeAngle(a: number, b: number, c: number): number {
+  function safeAngle(a: number, b: number, c: number, fallback: number): number {
     const r = gatedAngle(lm, a, b, c);
-    return r ? r.angle : 0;
+    return r ? r.angle : fallback;
   }
 
   // Neck flexion: ear–shoulder–hip plane, torso-normalized
@@ -284,23 +298,23 @@ export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidenc
   }
 
   // Upper arm angles (shoulder–elbow relative to torso)
-  const leftUpperArm = safeAngle(MP.LEFT_HIP, MP.LEFT_SHOULDER, MP.LEFT_ELBOW);
-  const rightUpperArm = safeAngle(MP.RIGHT_HIP, MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW);
+  const leftUpperArm  = safeAngle(MP.LEFT_HIP,  MP.LEFT_SHOULDER,  MP.LEFT_ELBOW,  prev?.leftUpperArm  ?? 0);
+  const rightUpperArm = safeAngle(MP.RIGHT_HIP, MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, prev?.rightUpperArm ?? 0);
 
   // Lower arm (elbow angle)
-  const leftLowerArm = safeAngle(MP.LEFT_SHOULDER, MP.LEFT_ELBOW, MP.LEFT_WRIST);
-  const rightLowerArm = safeAngle(MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, MP.RIGHT_WRIST);
+  const leftLowerArm  = safeAngle(MP.LEFT_SHOULDER,  MP.LEFT_ELBOW,  MP.LEFT_WRIST,  prev?.leftLowerArm  ?? 90);
+  const rightLowerArm = safeAngle(MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, MP.RIGHT_WRIST, prev?.rightLowerArm ?? 90);
 
   // Wrist deviation
-  const leftWrist = safeAngle(MP.LEFT_ELBOW, MP.LEFT_WRIST, MP.LEFT_INDEX);
-  const rightWrist = safeAngle(MP.RIGHT_ELBOW, MP.RIGHT_WRIST, MP.RIGHT_INDEX);
+  const leftWrist  = safeAngle(MP.LEFT_ELBOW,  MP.LEFT_WRIST,  MP.LEFT_INDEX,  prev?.leftWrist  ?? 0);
+  const rightWrist = safeAngle(MP.RIGHT_ELBOW, MP.RIGHT_WRIST, MP.RIGHT_INDEX, prev?.rightWrist ?? 0);
 
   // Knee angles
-  const leftKnee = safeAngle(MP.LEFT_HIP, MP.LEFT_KNEE, MP.LEFT_ANKLE);
-  const rightKnee = safeAngle(MP.RIGHT_HIP, MP.RIGHT_KNEE, MP.RIGHT_ANKLE);
+  const leftKnee  = safeAngle(MP.LEFT_HIP,  MP.LEFT_KNEE,  MP.LEFT_ANKLE,  prev?.leftKnee  ?? 180);
+  const rightKnee = safeAngle(MP.RIGHT_HIP, MP.RIGHT_KNEE, MP.RIGHT_ANKLE, prev?.rightKnee ?? 180);
 
   // Hip flexion
-  const hipFlexion = safeAngle(MP.LEFT_SHOULDER, MP.LEFT_HIP, MP.LEFT_KNEE);
+  const hipFlexion = safeAngle(MP.LEFT_SHOULDER, MP.LEFT_HIP, MP.LEFT_KNEE, prev?.hipFlexion ?? 180);
 
   // Average confidence of key joints
   const keyJoints = [
@@ -310,31 +324,68 @@ export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidenc
   ];
   const avgConfidence = keyJoints.reduce((s, i) => s + (lm[i]?.visibility ?? 0), 0) / keyJoints.length;
 
-  return {
-    angles: {
-      neckFlexion, neckLateral, trunkFlexion, trunkLateral, trunkRotation,
-      leftUpperArm, rightUpperArm, leftLowerArm, rightLowerArm,
-      leftWrist, rightWrist, leftKnee, rightKnee, hipFlexion,
-    },
-    avgConfidence,
+  // Shoulder abduction — arm raised out to the side (torso-frame projection)
+  let leftShoulderAbduction  = prev?.leftShoulderAbduction  ?? 0;
+  let rightShoulderAbduction = prev?.rightShoulderAbduction ?? 0;
+  if (frame) {
+    const ls = lm[MP.LEFT_SHOULDER],  le2 = lm[MP.LEFT_ELBOW];
+    const rs = lm[MP.RIGHT_SHOULDER], re2 = lm[MP.RIGHT_ELBOW];
+    if ((ls.visibility ?? 0) >= VISIBILITY_THRESHOLD && (le2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
+      const lArmVec = norm(sub(le2, ls));
+      leftShoulderAbduction = Math.abs((Math.asin(Math.max(-1, Math.min(1, dot(lArmVec, frame.right)))) * 180) / Math.PI);
+    }
+    if ((rs.visibility ?? 0) >= VISIBILITY_THRESHOLD && (re2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
+      const rArmVec = norm(sub(re2, rs));
+      rightShoulderAbduction = Math.abs((Math.asin(Math.max(-1, Math.min(1, dot(rArmVec, frame.right)))) * 180) / Math.PI);
+    }
+  }
+
+  // Forearm crossing midline (RULA lower-arm penalty)
+  let leftForearmCross  = prev?.leftForearmCross  ?? 0;
+  let rightForearmCross = prev?.rightForearmCross ?? 0;
+  if (frame) {
+    const le3 = lm[MP.LEFT_ELBOW],  lw2 = lm[MP.LEFT_WRIST];
+    const re3 = lm[MP.RIGHT_ELBOW], rw2 = lm[MP.RIGHT_WRIST];
+    if ((le3.visibility ?? 0) >= VISIBILITY_THRESHOLD && (lw2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
+      const lForeVec = norm(sub(lw2, le3));
+      leftForearmCross = Math.max(0, dot(lForeVec, frame.right) * 90);
+    }
+    if ((re3.visibility ?? 0) >= VISIBILITY_THRESHOLD && (rw2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
+      const rForeVec = norm(sub(rw2, re3));
+      rightForearmCross = Math.max(0, -dot(rForeVec, frame.right) * 90);
+    }
+  }
+
+  const angles: BodyAngles = {
+    neckFlexion, neckLateral, trunkFlexion, trunkLateral, trunkRotation,
+    leftUpperArm, rightUpperArm, leftLowerArm, rightLowerArm,
+    leftWrist, rightWrist, leftKnee, rightKnee, hipFlexion,
+    leftShoulderAbduction, rightShoulderAbduction,
+    leftForearmCross, rightForearmCross,
   };
+  _lastValidAngles = angles;
+  return { angles, avgConfidence };
 }
 
 // ─── RULA CALCULATOR ─────────────────────────────────────────────────────────
 export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: number): ScoreResult {
   const a = angles;
 
-  // Upper arm score
+  // Upper arm score (RULA Table 1)
   let upperArm = 1;
   const ua = Math.max(a.leftUpperArm, a.rightUpperArm);
   if (ua > 90) upperArm = 4;
   else if (ua > 45) upperArm = 3;
   else if (ua > 20) upperArm = 2;
+  // +1 if shoulder is abducted ≥45° (arm raised out to side)
+  if (Math.max(a.leftShoulderAbduction ?? 0, a.rightShoulderAbduction ?? 0) >= 45) upperArm += 1;
 
-  // Lower arm score
+  // Lower arm score (RULA Table 2)
   let lowerArm = 1;
   const la = Math.min(a.leftLowerArm, a.rightLowerArm); // elbow angle
   if (la < 60 || la > 100) lowerArm = 2;
+  // +1 if forearm crosses midline
+  if (Math.max(a.leftForearmCross ?? 0, a.rightForearmCross ?? 0) > 15) lowerArm = Math.min(3, lowerArm + 1);
 
   // Wrist score
   let wrist = 1;
@@ -349,11 +400,12 @@ export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: numb
   else if (a.neckFlexion > 10) neck = 2;
   if (a.neckLateral > 10) neck += 1;
 
-  // Trunk score
+  // Trunk score (RULA Table 5 — floor is 1 for 0–10°, neutral standing = no penalty)
   let trunk = 1;
   if (a.trunkFlexion > 60) trunk = 4;
   else if (a.trunkFlexion > 20) trunk = 3;
-  else if (a.trunkFlexion > 0) trunk = 2;
+  else if (a.trunkFlexion > 10) trunk = 2;
+  // 0–10° = 1 (neutral, no penalty)
   if (a.trunkLateral > 10) trunk += 1;
   if (a.trunkRotation > 15) trunk += 1;
 
@@ -403,11 +455,12 @@ export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: numb
   if (a.neckFlexion > 20 || a.neckFlexion < 0) neck = 2;
   if (a.neckLateral > 10) neck += 1;
 
-  // Trunk
+  // Trunk (REBA Table A — floor is 1 for 0–10°, neutral upright = no penalty)
   let trunk = 1;
   if (a.trunkFlexion > 60) trunk = 4;
   else if (a.trunkFlexion > 20) trunk = 3;
-  else if (a.trunkFlexion > 0) trunk = 2;
+  else if (a.trunkFlexion > 10) trunk = 2;
+  // 0–10° = 1 (neutral, no penalty)
   if (a.trunkLateral > 10) trunk += 1;
   if (a.trunkRotation > 15) trunk += 1;
 
@@ -417,12 +470,14 @@ export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: numb
   if (kneeAngle < 150) legs = 2; // bent
   if (kneeAngle < 120) legs = 3; // deeply bent
 
-  // Upper arm
+  // Upper arm (REBA Table B)
   const ua = Math.max(a.leftUpperArm, a.rightUpperArm);
   let upperArm = 1;
   if (ua > 90) upperArm = 4;
   else if (ua > 45) upperArm = 3;
   else if (ua > 20) upperArm = 2;
+  // +1 if shoulder is abducted ≥45°
+  if (Math.max(a.leftShoulderAbduction ?? 0, a.rightShoulderAbduction ?? 0) >= 45) upperArm += 1;
 
   // Lower arm
   const la = Math.min(a.leftLowerArm, a.rightLowerArm);

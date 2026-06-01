@@ -413,6 +413,10 @@ function VideoReplay({ session }: { session: SessionRecord }) {
         leftKnee:      lerp(aA.leftKnee,      aB.leftKnee),
         rightKnee:     lerp(aA.rightKnee,     aB.rightKnee),
         hipFlexion:    lerp(aA.hipFlexion,    aB.hipFlexion),
+        leftShoulderAbduction:  lerp(aA.leftShoulderAbduction  ?? 0, aB.leftShoulderAbduction  ?? 0),
+        rightShoulderAbduction: lerp(aA.rightShoulderAbduction ?? 0, aB.rightShoulderAbduction ?? 0),
+        leftForearmCross:  lerp(aA.leftForearmCross  ?? 0, aB.leftForearmCross  ?? 0),
+        rightForearmCross: lerp(aA.rightForearmCross ?? 0, aB.rightForearmCross ?? 0),
       };
     } else if (aA) {
       angles = aA;

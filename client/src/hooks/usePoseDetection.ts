@@ -227,91 +227,114 @@ const POSE_CONNECTIONS = [
   [24, 26], [26, 28], [28, 30], [28, 32], [30, 32],
 ];
 
-import { VISIBILITY_THRESHOLD, riskColor } from '@/lib/ergo-engine';
+import { VISIBILITY_THRESHOLD, extractAngles } from '@/lib/ergo-engine';
 
+// ─── Per-segment angle-based stoplight colors ─────────────────────────────────
+const C_SAFE    = '#22c55e';
+const C_CAUTION = '#f59e0b';
+const C_RISK    = '#f97316';
+const C_DANGER  = '#ef4444';
+
+function angleToColor(angle: number, caution: number, risk: number, danger: number): string {
+  if (angle >= danger)  return C_DANGER;
+  if (angle >= risk)    return C_RISK;
+  if (angle >= caution) return C_CAUTION;
+  return C_SAFE;
+}
+
+const SEG_NECK    = [0, 7, 8, 1, 2, 3, 4, 5, 6];
+const SEG_TRUNK   = [11, 12, 23, 24];
+const SEG_L_UPPER = [11, 13];
+const SEG_R_UPPER = [12, 14];
+const SEG_L_LOWER = [13, 15, 17, 19, 21];
+const SEG_R_LOWER = [14, 16, 18, 20, 22];
+const SEG_L_LEG   = [23, 25, 27, 29, 31];
+const SEG_R_LEG   = [24, 26, 28, 30, 32];
+
+function buildLiveColors(lm: Landmarks): Record<number, string> {
+  const { angles } = extractAngles(lm);
+  const neckColor   = angleToColor(Math.abs(angles.neckFlexion),        10, 20, 30);
+  const trunkColor  = angleToColor(angles.trunkFlexion,                 10, 20, 60);
+  const lUpperColor = angleToColor(angles.leftUpperArm,                 20, 45, 90);
+  const rUpperColor = angleToColor(angles.rightUpperArm,                20, 45, 90);
+  const lLowerColor = angleToColor(Math.abs(angles.leftLowerArm - 80),  20, 40, 60);
+  const rLowerColor = angleToColor(Math.abs(angles.rightLowerArm - 80), 20, 40, 60);
+  const lLegColor   = angleToColor(180 - angles.leftKnee,               10, 30, 60);
+  const rLegColor   = angleToColor(180 - angles.rightKnee,              10, 30, 60);
+  const map: Record<number, string> = {};
+  for (const i of SEG_NECK)    map[i] = neckColor;
+  for (const i of SEG_TRUNK)   map[i] = trunkColor;
+  for (const i of SEG_L_UPPER) map[i] = lUpperColor;
+  for (const i of SEG_R_UPPER) map[i] = rUpperColor;
+  for (const i of SEG_L_LOWER) map[i] = lLowerColor;
+  for (const i of SEG_R_LOWER) map[i] = rLowerColor;
+  for (const i of SEG_L_LEG)   map[i] = lLegColor;
+  for (const i of SEG_R_LEG)   map[i] = rLegColor;
+  return map;
+}
+
+function letterboxRectLive(cW: number, cH: number, vW: number, vH: number) {
+  const scale = Math.min(cW / vW, cH / vH);
+  const drawW = vW * scale;
+  const drawH = vH * scale;
+  return { x: (cW - drawW) / 2, y: (cH - drawH) / 2, w: drawW, h: drawH };
+}
+
+// Canvas buffer is sized once by the LiveScan component on mount/resize.
+// drawSkeleton NEVER resizes canvas.width/height — that forces a GPU flush every frame.
 function drawSkeleton(
   canvas: HTMLCanvasElement,
   video: HTMLVideoElement,
   lm: Landmarks,
-  snap: ErgoSnapshot | null,
+  _snap: ErgoSnapshot | null,
 ) {
-  canvas.width = video.videoWidth || 640;
-  canvas.height = video.videoHeight || 480;
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  const W = canvas.width;
-  const H = canvas.height;
+  const cW = canvas.width  || canvas.offsetWidth  || 640;
+  const cH = canvas.height || canvas.offsetHeight || 480;
+  const vW = video.videoWidth  || 640;
+  const vH = video.videoHeight || 480;
 
-  // Determine joint risk colors
-  const jointColor = (i: number): string => {
-    const vis = lm[i]?.visibility ?? 0;
-    if (vis < VISIBILITY_THRESHOLD) return 'rgba(255,255,255,0.2)';
-    if (!snap) return '#22D3EE';
-    // Color upper body joints by RULA risk, lower by REBA
-    const upperBody = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
-    const risk = upperBody.includes(i) ? snap.rula.riskLevel : snap.reba.riskLevel;
-    return riskColor(risk);
-  };
+  const lb = letterboxRectLive(cW, cH, vW, vH);
+  ctx.clearRect(0, 0, cW, cH);
+  // Draw the live video frame
+  ctx.drawImage(video, lb.x, lb.y, lb.w, lb.h);
 
-  // Draw connections
-  ctx.lineWidth = 2.5;
+  const colorMap = buildLiveColors(lm);
+  const px = (lmx: number) => lb.x + lmx * lb.w;
+  const py = (lmy: number) => lb.y + lmy * lb.h;
+
+  // Draw connections — thin, round caps, gradient between different risk colors
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 1.5;
   for (const [a, b] of POSE_CONNECTIONS) {
-    const la = lm[a], lb = lm[b];
-    if (!la || !lb) continue;
-    const visA = la.visibility ?? 0;
-    const visB = lb.visibility ?? 0;
-    if (visA < VISIBILITY_THRESHOLD || visB < VISIBILITY_THRESHOLD) continue;
-
+    const la = lm[a], lb2 = lm[b];
+    if (!la || !lb2) continue;
+    if ((la.visibility ?? 0) < VISIBILITY_THRESHOLD || (lb2.visibility ?? 0) < VISIBILITY_THRESHOLD) continue;
+    const cA = colorMap[a] ?? C_SAFE;
+    const cB = colorMap[b] ?? C_SAFE;
+    if (cA === cB) {
+      ctx.strokeStyle = cA;
+    } else {
+      const grad = ctx.createLinearGradient(px(la.x), py(la.y), px(lb2.x), py(lb2.y));
+      grad.addColorStop(0, cA);
+      grad.addColorStop(1, cB);
+      ctx.strokeStyle = grad;
+    }
     ctx.beginPath();
-    ctx.moveTo(la.x * W, la.y * H);
-    ctx.lineTo(lb.x * W, lb.y * H);
-    ctx.strokeStyle = 'rgba(34, 211, 238, 0.6)';
+    ctx.moveTo(px(la.x), py(la.y));
+    ctx.lineTo(px(lb2.x), py(lb2.y));
     ctx.stroke();
   }
 
-  // Draw joints
+  // Draw joints — clean 2.5px dots, no halos
   for (let i = 0; i < lm.length; i++) {
     const pt = lm[i];
-    if (!pt) continue;
-    const vis = pt.visibility ?? 0;
-    if (vis < VISIBILITY_THRESHOLD) continue;
-
-    const x = pt.x * W;
-    const y = pt.y * H;
-    const color = jointColor(i);
-
-    // Outer glow
-    ctx.beginPath();
-    ctx.arc(x, y, 6, 0, Math.PI * 2);
-    ctx.fillStyle = color.replace(')', ', 0.25)').replace('rgb', 'rgba');
-    ctx.fill();
-
-    // Inner dot
-    ctx.beginPath();
-    ctx.arc(x, y, 3.5, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
-  }
-
-  // Draw confidence badge on key joints
-  const keyLabels: [number, string][] = [
-    [11, 'L.Sh'], [12, 'R.Sh'],
-    [13, 'L.El'], [14, 'R.El'],
-    [15, 'L.Wr'], [16, 'R.Wr'],
-    [23, 'L.Hip'], [24, 'R.Hip'],
-  ];
-  ctx.font = '9px Inter, sans-serif';
-  ctx.textAlign = 'center';
-  for (const [i, label] of keyLabels) {
-    const pt = lm[i];
     if (!pt || (pt.visibility ?? 0) < VISIBILITY_THRESHOLD) continue;
-    const x = pt.x * W;
-    const y = pt.y * H - 10;
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.fillRect(x - 14, y - 9, 28, 11);
-    ctx.fillStyle = '#fff';
-    ctx.fillText(label, x, y);
+    ctx.beginPath();
+    ctx.arc(px(pt.x), py(pt.y), 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = colorMap[i] ?? C_SAFE;
+    ctx.fill();
   }
 }
