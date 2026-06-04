@@ -32,7 +32,7 @@
  *   Letterbox: scale = min(W/vW, H/vH), drawX/Y = centered offset
  *   Landmark mapping: px = drawX + lm.x * drawW
  */
-import { useRef, useState, useCallback, useContext, useEffect } from 'react';
+import { useRef, useState, useCallback, useContext, useEffect, startTransition } from 'react';
 import { useLocation } from 'wouter';
 import {
   Upload, Film, Play, CheckCircle2, AlertCircle,
@@ -370,6 +370,8 @@ export default function VideoUpload() {
     setResultId(record.id);
     setAnalysisState('done');
     setProgress(100);
+    // Seek back to frame 0 so the video shows the first frame (not a black end-of-video frame)
+    if (video) { video.currentTime = 0; }
 
     // Persist video blob to IDB (fire-and-forget — don't block UI)
     if (videoFile) {
@@ -418,8 +420,9 @@ export default function VideoUpload() {
       }
 
       // Draw skeleton overlay (canvas is transparent, video shows through)
+      // Guard: only draw if video has decoded dimensions (readyState >= 2 = HAVE_CURRENT_DATA)
       const lm = latestLandmarksRef.current;
-      if (lm && lm.length > 0) {
+      if (lm && lm.length > 0 && video.readyState >= 2 && video.videoWidth > 0) {
         drawSkeleton(ctx, W, H, video, lm, riskColorsRef.current, latestSegColorsRef.current);
       }
 
@@ -477,6 +480,8 @@ export default function VideoUpload() {
 
   const startReportSampler = useCallback((video: HTMLVideoElement) => {
       // Sample at 250ms intervals — update React state and collect snapshots
+    // 333ms = ~3fps sampling rate — sufficient for ergonomic posture analysis
+    // (REBA/RULA are static posture tools; 3fps captures all meaningful posture changes)
     reportIntervalRef.current = setInterval(() => {
       if (!isRunningRef.current || video.paused || video.ended) return;
       const lm = latestLandmarksRef.current;
@@ -486,13 +491,17 @@ export default function VideoUpload() {
       const snap = computeSnapshot(lm, taskProfileRef.current);
       if (snap) {
         snapshotsRef.current.push({ ...snap, timestamp: video.currentTime * 1000, landmarks: lm });
-        setFramesAnalyzed(n => n + 1);
-        setLiveScores({ rula: snap.rula.score, reba: snap.reba.score });
-        if (video.duration > 0) {
-          setProgress(Math.round((video.currentTime / video.duration) * 100));
-        }
+        // Use startTransition so React batches these low-priority UI updates
+        // without blocking the video frame rendering loop
+        const ct = video.currentTime;
+        const dur = video.duration;
+        startTransition(() => {
+          setFramesAnalyzed(n => n + 1);
+          setLiveScores({ rula: snap.rula.score, reba: snap.reba.score });
+          if (dur > 0) setProgress(Math.round((ct / dur) * 100));
+        });
       }
-    }, 250);
+    }, 333);
   }, []);
 
   const analyzeVideo = useCallback(async () => {

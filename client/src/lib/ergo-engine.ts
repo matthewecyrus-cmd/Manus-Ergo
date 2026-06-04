@@ -539,17 +539,60 @@ export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: numb
   let wristScore = 1;
   if (wr > 15) wristScore = 2;
 
-  // Load/force
-  const loadScore = task.loadWeight > 10 ? 3 : task.loadWeight > 5 ? 2 : 0;
+  // Load/force (+1 if load applied suddenly/shockingly)
+  const loadScore = task.loadWeight > 10 ? 3 : task.loadWeight > 5 ? 2 : task.loadWeight > 0 ? 1 : 0;
   // Coupling
   const couplingScore = { good: 0, fair: 1, poor: 2 }[task.coupling];
   // Activity
   const activityScore = task.repRate > 4 ? 1 : 0;
 
-  const tableA = Math.min(9, neck + trunk + legs);
-  const tableB = Math.min(9, upperArm + lowerArm + wristScore);
-  const scoreC = Math.min(12, tableA + tableB);
-  const rebaScore = Math.min(15, scoreC + loadScore + couplingScore + activityScore);
+  // REBA Table A: [neck-1][trunk-1][legs-1] — Hignett & McAtamney 2000
+  // neck: 1-3, trunk: 1-5, legs: 1-4
+  const REBA_TABLE_A: number[][][] = [
+    // neck=1: trunk 1..5, each with legs 1..4
+    [[1,2,3,4],[2,3,4,5],[2,4,5,6],[3,5,6,7],[4,6,7,8]],
+    // neck=2
+    [[1,3,4,5],[3,4,5,6],[3,5,6,7],[4,6,7,8],[5,7,8,9]],
+    // neck=3
+    [[3,3,5,6],[4,5,6,7],[5,6,7,8],[6,7,8,9],[6,8,9,9]],
+  ];
+  // REBA Table B (upperArm 1-6, lowerArm 1-2, wrist 1-3)
+  const REBA_TABLE_B: number[][][] = [
+    // lowerArm=1
+    [[1,2,2],[1,2,3],[3,4,5],[4,5,5],[6,7,8],[7,8,8]],
+    // lowerArm=2
+    [[1,2,3],[2,3,4],[4,5,5],[5,6,7],[7,8,8],[8,9,9]],
+  ];
+  // REBA Table C (scoreA 1-12, scoreB 1-12)
+  const REBA_TABLE_C: number[][] = [
+    [1, 1, 1, 2, 3, 3, 4, 5, 6, 7, 7, 7],
+    [1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 7, 8],
+    [2, 3, 3, 3, 4, 5, 6, 7, 7, 8, 8, 8],
+    [3, 4, 4, 4, 5, 6, 7, 8, 8, 9, 9, 9],
+    [4, 4, 4, 5, 6, 7, 8, 8, 9, 9,10,10],
+    [6, 6, 6, 7, 8, 8, 9, 9,10,10,11,11],
+    [7, 7, 7, 8, 9, 9, 9,10,11,11,11,12],
+    [8, 8, 8, 9,10,10,10,10,11,11,12,12],
+    [9, 9, 9,10,10,10,11,11,12,12,12,12],
+    [10,10,10,11,11,11,11,12,12,12,12,12],
+    [11,11,11,11,12,12,12,12,12,12,12,12],
+    [12,12,12,12,12,12,12,12,12,12,12,12],
+  ];
+
+  const neckIdx  = Math.min(2, neck - 1);
+  const trunkIdx = Math.min(4, trunk - 1);
+  const legsIdx  = Math.min(3, legs - 1);
+  const scoreA = REBA_TABLE_A[neckIdx]?.[trunkIdx]?.[legsIdx] ?? Math.min(12, neck + trunk + legs);
+
+  const uaIdx  = Math.min(5, upperArm - 1);
+  const laIdx  = Math.min(1, lowerArm - 1);
+  const wrIdx  = Math.min(2, wristScore - 1);
+  const scoreB = REBA_TABLE_B[laIdx]?.[uaIdx]?.[wrIdx] ?? Math.min(12, upperArm + lowerArm + wristScore);
+
+  const scAIdx = Math.min(11, (scoreA + loadScore + couplingScore) - 1);
+  const scBIdx = Math.min(11, scoreB - 1);
+  const scoreC = REBA_TABLE_C[scAIdx]?.[scBIdx] ?? Math.min(12, scoreA + scoreB);
+  const rebaScore = Math.min(15, scoreC + activityScore);
 
   let actionLevel = 0;
   if (rebaScore >= 11) actionLevel = 4;

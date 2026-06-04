@@ -372,16 +372,39 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     // If we already have a live URL (same-page session, not yet navigated away), use it
     if (videoUrl && videoUrl.startsWith('blob:')) return;
     if (session.source !== 'video-upload') return;
-    setVideoLoading(true);
-    loadVideo(session.id).then(url => {
-      if (url) {
-        objectUrlRef.current = url;
-        setVideoUrl(url);
+
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const tryLoad = async (attemptsLeft: number) => {
+      if (cancelled) return;
+      setVideoLoading(true);
+      try {
+        const url = await loadVideo(session.id);
+        if (cancelled) { if (url) URL.revokeObjectURL(url); return; }
+        if (url) {
+          objectUrlRef.current = url;
+          setVideoUrl(url);
+          setVideoLoading(false);
+          return;
+        }
+        // IDB write may still be in progress — retry
+        if (attemptsLeft > 0) {
+          retryTimer = setTimeout(() => tryLoad(attemptsLeft - 1), 1000);
+        } else {
+          setVideoLoading(false); // Give up after 8 retries
+        }
+      } catch (err) {
+        console.warn('[ErgoKit] Could not load video from IDB:', err);
+        if (!cancelled) setVideoLoading(false);
       }
-    }).catch(err => {
-      console.warn('[ErgoKit] Could not load video from IDB:', err);
-    }).finally(() => setVideoLoading(false));
+    };
+
+    tryLoad(8); // up to 8 retries = ~8 seconds total
+
     return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       // Revoke the Object URL we created from IDB on unmount
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
