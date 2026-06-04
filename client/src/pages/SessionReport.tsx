@@ -15,7 +15,7 @@
  *   9. Corrective Actions — owner/status tracker
  *  10. Before/After Comparison (if reassessment)
  */
-import { useRef, useState, useCallback, useEffect } from 'react';
+import { useRef, useState, useCallback, useEffect, useMemo } from 'react';
 import { useParams, useLocation, Link } from 'wouter';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip,
@@ -34,6 +34,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { useSession } from '@/contexts/SessionContext';
 import { riskBgClass, riskLabel, riskColor, buildBodyRegions, generateRecommendations, extractAngles } from '@/lib/ergo-engine';
 import { exportSessionPdf } from '@/lib/pdf-export';
+import { loadVideo } from '@/lib/video-store';
 import type { BodyAngles } from '@/lib/ergo-engine';
 import { toast } from 'sonner';
 import type {
@@ -301,17 +302,15 @@ function drawReplayFrame(
   // Canvas is transparent — video element shows through (handles rotation correctly)
   ctx.clearRect(0, 0, W, H);
 
-  // Rotation-aware letterbox: detect if browser has rotated the video
+  // Letterbox: map normalized [0,1] landmark coords to the area the video
+  // actually occupies inside the canvas (object-contain letterboxing).
+  // We use video.videoWidth/Height (the decoded frame dimensions) directly.
+  // The canvas buffer is sized to match the container's CSS pixel dimensions.
   const rawW = video.videoWidth  || W;
   const rawH = video.videoHeight || H;
-  const displayAR = (video.clientWidth || W) / (video.clientHeight || H);
-  const rawAR = rawW / rawH;
-  const isRotated = Math.abs(displayAR - rawAR) > 0.3 && Math.abs(displayAR - (1 / rawAR)) < 0.3;
-  const effW = isRotated ? rawH : rawW;
-  const effH = isRotated ? rawW : rawH;
-  const scale = Math.min(W / effW, H / effH);
-  const drawW = effW * scale;
-  const drawH = effH * scale;
+  const scale = Math.min(W / rawW, H / rawH);
+  const drawW = rawW * scale;
+  const drawH = rawH * scale;
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
 
@@ -357,10 +356,41 @@ function VideoReplay({ session }: { session: SessionRecord }) {
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  // Dynamic aspect ratio — set once video metadata loads
+  const [videoAspect, setVideoAspect] = useState<string>('16 / 9');
   // Risk colors always active — no toggle needed
   const riskColorsRef = useRef(true);
 
-  const videoUrl = (session as any).videoUrl as string | undefined;
+  // Load video from IndexedDB (blob URLs die on navigation; IDB persists)
+  const [videoUrl, setVideoUrl] = useState<string | null>(
+    (session as any).videoUrl as string | null ?? null
+  );
+  const [videoLoading, setVideoLoading] = useState(false);
+  const objectUrlRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    // If we already have a live URL (same-page session, not yet navigated away), use it
+    if (videoUrl && videoUrl.startsWith('blob:')) return;
+    if (session.source !== 'video-upload') return;
+    setVideoLoading(true);
+    loadVideo(session.id).then(url => {
+      if (url) {
+        objectUrlRef.current = url;
+        setVideoUrl(url);
+      }
+    }).catch(err => {
+      console.warn('[ErgoKit] Could not load video from IDB:', err);
+    }).finally(() => setVideoLoading(false));
+    return () => {
+      // Revoke the Object URL we created from IDB on unmount
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.id, session.source]);
+
   const snapshots = session.snapshots;
 
   // Sort snapshots by timestamp once
@@ -516,7 +546,14 @@ function VideoReplay({ session }: { session: SessionRecord }) {
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    const onMeta = () => { setDuration(v.duration); sizeCanvas(); setTimeout(() => drawFrame(), 100); };
+    const onMeta = () => {
+      setDuration(v.duration);
+      if (v.videoWidth && v.videoHeight) {
+        setVideoAspect(`${v.videoWidth} / ${v.videoHeight}`);
+      }
+      sizeCanvas();
+      setTimeout(() => drawFrame(), 100);
+    };
     const onEnd = () => { setPlaying(false); stopLoop(); };
     v.addEventListener('loadedmetadata', onMeta);
     v.addEventListener('ended', onEnd);
@@ -527,12 +564,17 @@ function VideoReplay({ session }: { session: SessionRecord }) {
     return (
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-sm flex items-center gap-2"><Eye className="w-4 h-4 text-sky-500" />Video Replay</CardTitle>
+          <CardTitle className="text-sm flex items-center gap-2"><Eye className="w-4 h-4 text-sky-500" />Video Replay with Skeleton Overlay</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="rounded-xl bg-slate-100 aspect-video flex flex-col items-center justify-center gap-3 text-muted-foreground">
-            <Eye className="w-10 h-10 opacity-30" />
-            <p className="text-sm">Video replay is available for video-upload sessions only.</p>
+            {videoLoading ? (
+              <><div className="w-8 h-8 border-2 border-sky-400 border-t-transparent rounded-full animate-spin" /><p className="text-sm">Loading video…</p></>
+            ) : session.source === 'video-upload' ? (
+              <><Eye className="w-10 h-10 opacity-30" /><p className="text-sm text-center px-4">Video not found. It may have been cleared from browser storage. Re-upload the video to restore replay.</p></>
+            ) : (
+              <><Eye className="w-10 h-10 opacity-30" /><p className="text-sm">Video replay is available for video-upload sessions only.</p></>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -549,7 +591,7 @@ function VideoReplay({ session }: { session: SessionRecord }) {
         <p className="text-xs text-muted-foreground">The colored skeleton shows the AI's joint tracking. Green = safe, amber = caution, red = high risk.</p>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
+        <div className="relative rounded-xl overflow-hidden bg-black w-full max-h-[70vh]" style={{ aspectRatio: videoAspect }}>
           {/* Video always visible — handles rotation correctly via browser CSS */}
           <video ref={videoRef} src={videoUrl} className="absolute inset-0 w-full h-full object-contain" style={{ zIndex: 1, pointerEvents: 'none' }} muted preload="auto" playsInline />
           {/* Canvas is transparent overlay — only draws skeleton lines */}

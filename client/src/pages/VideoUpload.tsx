@@ -50,6 +50,7 @@ import { toast } from 'sonner';
 import { useSession, SessionContext } from '@/contexts/SessionContext';
 import { EMAFilter, computeSnapshot, riskLabel, summarizeSession, extractAngles, resetAngleState } from '@/lib/ergo-engine';
 import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord, BodyAngles } from '@/lib/ergo-engine';
+import { saveVideo } from '@/lib/video-store';
 
 const MEDIAPIPE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
 const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
@@ -151,23 +152,15 @@ function drawSkeleton(
   riskColors: boolean,
   segColors: SegColors | null,
 ) {
-  // Use the video's natural display dimensions (after CSS object-contain letterboxing)
-  // video.videoWidth/Height are the RAW frame dimensions (before browser rotation)
-  // The browser applies the rotation flag when rendering, so the displayed aspect ratio
-  // may be swapped. We detect this by comparing the video element's clientWidth/Height.
+  // Letterbox: map normalized [0,1] landmark coords to the area the video
+  // actually occupies inside the canvas (object-contain letterboxing).
+  // MediaPipe normalizes landmarks to the decoded frame dimensions (videoWidth x videoHeight),
+  // so we use those directly — no rotation detection needed.
   const rawW = video.videoWidth  || W;
   const rawH = video.videoHeight || H;
-  // Detect if the browser has rotated the video (portrait video in landscape container)
-  const displayAR = (video.clientWidth || W) / (video.clientHeight || H);
-  const rawAR = rawW / rawH;
-  // If the display AR and raw AR differ significantly, the video is rotated
-  const isRotated = Math.abs(displayAR - rawAR) > 0.3 && Math.abs(displayAR - (1 / rawAR)) < 0.3;
-  // Use the effective display dimensions for letterbox calculation
-  const effW = isRotated ? rawH : rawW;
-  const effH = isRotated ? rawW : rawH;
-  const scale = Math.min(W / effW, H / effH);
-  const drawW = effW * scale;
-  const drawH = effH * scale;
+  const scale = Math.min(W / rawW, H / rawH);
+  const drawW = rawW * scale;
+  const drawH = rawH * scale;
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
 
@@ -228,6 +221,7 @@ export default function VideoUpload() {
   const [notes, setNotes] = useState('');
   const [baselineId, setBaselineId] = useState('');
   const [configOpen, setConfigOpen] = useState(true);
+  const [videoAspect, setVideoAspect] = useState<string>('16 / 9');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -367,17 +361,28 @@ export default function VideoUpload() {
       },
     );
     if (baselineId) (record as any).baselineSessionId = baselineId;
-    (record as any).videoUrl = videoUrl;
+    // Do NOT store blob URL — it dies on navigation.
+    // Save the raw video blob to IndexedDB keyed by session ID instead.
+    // SessionReport will call loadVideo(session.id) to get a fresh Object URL.
+    (record as any).videoUrl = undefined;
 
     addSession(record);
     setResultId(record.id);
     setAnalysisState('done');
     setProgress(100);
+
+    // Persist video blob to IDB (fire-and-forget — don't block UI)
+    if (videoFile) {
+      saveVideo(record.id, videoFile).catch(err =>
+        console.warn('[ErgoKit] Could not save video to IDB:', err)
+      );
+    }
+
     toast.success('Analysis complete!', {
       description: `${snapshots.length} samples · Peak risk: ${riskLabel(record.peakRisk)}`,
       action: { label: 'View Report', onClick: () => navigate(`/sessions/${record.id}`) },
     });
-  }, [stopLoops, assessor, department, workLocation, notes, baselineId, videoUrl, addSession, navigate]);
+  }, [stopLoops, assessor, department, workLocation, notes, baselineId, videoFile, addSession, navigate]);
 
   const startOverlayLoop = useCallback((video: HTMLVideoElement, canvas: HTMLCanvasElement) => {
     const ctx = canvas.getContext('2d');
@@ -430,25 +435,12 @@ export default function VideoUpload() {
           // Use same letterbox math as the overlay
           const rawW = video.videoWidth || W;
           const rawH = video.videoHeight || H;
-          const dispAR = (video.clientWidth || W) / (video.clientHeight || H);
-          const rawAR = rawW / rawH;
-          const rotated = Math.abs(dispAR - rawAR) > 0.3 && Math.abs(dispAR - (1 / rawAR)) < 0.3;
-          const effW = rotated ? rawH : rawW;
-          const effH = rotated ? rawW : rawH;
-          const scale = Math.min(W / effW, H / effH);
-          const dW = effW * scale; const dH = effH * scale;
+          const scale = Math.min(W / rawW, H / rawH);
+          const dW = rawW * scale; const dH = rawH * scale;
           const dX = (W - dW) / 2; const dY = (H - dH) / 2;
           tCtx.fillStyle = '#000';
           tCtx.fillRect(0, 0, W, H);
-          if (rotated) {
-            tCtx.save();
-            tCtx.translate(W / 2, H / 2);
-            tCtx.rotate(-Math.PI / 2);
-            tCtx.drawImage(video, -dH / 2, -dW / 2, dH, dW);
-            tCtx.restore();
-          } else {
-            tCtx.drawImage(video, dX, dY, dW, dH);
-          }
+          tCtx.drawImage(video, dX, dY, dW, dH);
           // Composite skeleton overlay on top
           tCtx.drawImage(canvas, 0, 0);
           thumbnailDataUrlRef.current = thumb.toDataURL('image/jpeg', 0.7);
@@ -625,7 +617,7 @@ export default function VideoUpload() {
                 During analysis: canvas visible (opacity 1), video controls hidden.
                 Before/after: video visible with controls, canvas hidden (opacity 0).
               */}
-              <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
+              <div className="relative rounded-xl overflow-hidden bg-black w-full max-h-[70vh]" style={{ aspectRatio: videoAspect }}>
                 <video
                   ref={videoRef}
                   src={videoUrl ?? undefined}
@@ -635,6 +627,12 @@ export default function VideoUpload() {
                   preload="auto"
                   playsInline
                   muted
+                  onLoadedMetadata={e => {
+                    const v = e.currentTarget;
+                    if (v.videoWidth && v.videoHeight) {
+                      setVideoAspect(`${v.videoWidth} / ${v.videoHeight}`);
+                    }
+                  }}
                 />
                 <canvas
                   ref={canvasRef}

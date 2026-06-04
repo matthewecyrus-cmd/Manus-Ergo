@@ -115,15 +115,15 @@ export interface TaskProfile {
 
 export const DEFAULT_TASK_PROFILE: TaskProfile = {
   taskName: 'General Task',
-  loadWeight: 5,
-  repRate: 10,
-  cycleDuration: 6,
-  horizontalDistance: 30,
+  loadWeight: 0,        // No load assumed until user configures task
+  repRate: 1,           // Low repetition rate — conservative default
+  cycleDuration: 30,    // 30s cycle — non-repetitive default
+  horizontalDistance: 25,
   verticalOrigin: 75,
   verticalDestination: 100,
   asymmetryAngle: 0,
-  coupling: 'fair',
-  duration: 'moderate',
+  coupling: 'good',     // Good coupling assumed until user configures
+  duration: 'short',    // Short duration — conservative default
   dominantSide: 'right',
 };
 
@@ -277,29 +277,69 @@ export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidenc
   }
 
   // Trunk flexion (torso-normalized)
+  // Uses 2D image-plane approach for reliability: MediaPipe z-depth is noisy.
+  // Trunk flexion = angle of spine vector from vertical in the image plane.
+  // This is the most reliable measure from a monocular camera.
   let trunkFlexion = 0, trunkLateral = 0, trunkRotation = 0;
-  if (frame) {
+  {
     const lh = lm[MP.LEFT_HIP], rh = lm[MP.RIGHT_HIP];
-    const midHip: Vec3 = { x: (lh.x + rh.x) / 2, y: (lh.y + rh.y) / 2, z: (lh.z + rh.z) / 2 };
     const ls = lm[MP.LEFT_SHOULDER], rs = lm[MP.RIGHT_SHOULDER];
-    const midShoulder: Vec3 = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2, z: (ls.z + rs.z) / 2 };
-    const spineVec = sub(midShoulder, midHip);
-    // Flexion: angle in sagittal plane from vertical
-    const sagittal = projectOntoPlane(spineVec, frame.right);
-    trunkFlexion = Math.abs((Math.atan2(dot(sagittal, frame.forward), dot(sagittal, frame.up)) * 180) / Math.PI);
-    // Lateral: angle in frontal plane
-    const frontal = projectOntoPlane(spineVec, frame.forward);
-    trunkLateral = Math.abs((Math.atan2(dot(frontal, frame.right), dot(frontal, frame.up)) * 180) / Math.PI);
-    // Rotation: shoulder vs hip alignment
-    const shoulderVec = norm(sub(rs, ls));
-    const hipVec = norm(sub(rh, lh));
-    const rotCos = Math.max(-1, Math.min(1, dot(shoulderVec, hipVec)));
-    trunkRotation = (Math.acos(rotCos) * 180) / Math.PI;
+    const allVis = [ls, rs, lh, rh].every(p => (p.visibility ?? 0) >= VISIBILITY_THRESHOLD);
+    if (allVis) {
+      const midHip: Vec3 = { x: (lh.x + rh.x) / 2, y: (lh.y + rh.y) / 2, z: 0 };
+      const midShoulder: Vec3 = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2, z: 0 };
+      // 2D spine vector (image coords: y increases downward)
+      const dx = midShoulder.x - midHip.x;
+      const dy = midShoulder.y - midHip.y; // negative = shoulder above hip (normal)
+      // Angle from vertical: 0° = upright, 90° = horizontal
+      // atan2(|dx|, |dy|) gives deviation from vertical axis
+      trunkFlexion = Math.min(90, Math.abs((Math.atan2(Math.abs(dx), Math.abs(dy)) * 180) / Math.PI));
+      // Lateral bending: asymmetry of shoulder vs hip horizontal positions
+      const shoulderWidth = Math.abs(rs.x - ls.x);
+      const hipWidth = Math.abs(rh.x - lh.x);
+      if (shoulderWidth > 0.01 && hipWidth > 0.01) {
+        const shoulderMidX = (ls.x + rs.x) / 2;
+        const hipMidX = (lh.x + rh.x) / 2;
+        const lateralShift = Math.abs(shoulderMidX - hipMidX);
+        const refWidth = (shoulderWidth + hipWidth) / 2;
+        trunkLateral = Math.min(45, (lateralShift / refWidth) * 45);
+      }
+      // Rotation: shoulder vs hip alignment (3D z-depth)
+      if (frame) {
+        const shoulderVec = norm(sub(rs, ls));
+        const hipVec = norm(sub(rh, lh));
+        const rotCos = Math.max(-1, Math.min(1, dot(shoulderVec, hipVec)));
+        trunkRotation = Math.min(45, (Math.acos(rotCos) * 180) / Math.PI);
+      }
+    }
   }
 
-  // Upper arm angles (shoulder–elbow relative to torso)
-  const leftUpperArm  = safeAngle(MP.LEFT_HIP,  MP.LEFT_SHOULDER,  MP.LEFT_ELBOW,  prev?.leftUpperArm  ?? 0);
-  const rightUpperArm = safeAngle(MP.RIGHT_HIP, MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, prev?.rightUpperArm ?? 0);
+  // Upper arm elevation: angle of shoulder–elbow vector from the torso vertical.
+  // REBA/RULA measure how far the arm is raised from the side of the body.
+  // We compute this in 2D image plane: angle of (elbow - shoulder) from (hip - shoulder) direction.
+  // This gives 0° when arm hangs straight down, 90° when arm is horizontal.
+  let leftUpperArm  = prev?.leftUpperArm  ?? 0;
+  let rightUpperArm = prev?.rightUpperArm ?? 0;
+  {
+    const ls = lm[MP.LEFT_SHOULDER],  le = lm[MP.LEFT_ELBOW],  lh2 = lm[MP.LEFT_HIP];
+    const rs = lm[MP.RIGHT_SHOULDER], re = lm[MP.RIGHT_ELBOW], rh2 = lm[MP.RIGHT_HIP];
+    if ((ls.visibility ?? 0) >= VISIBILITY_THRESHOLD && (le.visibility ?? 0) >= VISIBILITY_THRESHOLD &&
+        (lh2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
+      // Torso down vector: shoulder → hip
+      const torsoDownL = norm({ x: lh2.x - ls.x, y: lh2.y - ls.y, z: 0 });
+      const armVecL = norm({ x: le.x - ls.x, y: le.y - ls.y, z: 0 });
+      const cosL = Math.max(-1, Math.min(1, torsoDownL.x * armVecL.x + torsoDownL.y * armVecL.y));
+      // Angle from torso-down: 0° = arm at side, 90° = arm horizontal, 180° = arm overhead
+      leftUpperArm = Math.min(180, (Math.acos(cosL) * 180) / Math.PI);
+    }
+    if ((rs.visibility ?? 0) >= VISIBILITY_THRESHOLD && (re.visibility ?? 0) >= VISIBILITY_THRESHOLD &&
+        (rh2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
+      const torsoDownR = norm({ x: rh2.x - rs.x, y: rh2.y - rs.y, z: 0 });
+      const armVecR = norm({ x: re.x - rs.x, y: re.y - rs.y, z: 0 });
+      const cosR = Math.max(-1, Math.min(1, torsoDownR.x * armVecR.x + torsoDownR.y * armVecR.y));
+      rightUpperArm = Math.min(180, (Math.acos(cosR) * 180) / Math.PI);
+    }
+  }
 
   // Lower arm (elbow angle)
   const leftLowerArm  = safeAngle(MP.LEFT_SHOULDER,  MP.LEFT_ELBOW,  MP.LEFT_WRIST,  prev?.leftLowerArm  ?? 90);
