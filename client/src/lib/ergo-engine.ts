@@ -958,8 +958,25 @@ export function summarizeSession(
   source: SessionSource = 'camera',
   meta?: { assessor?: string; department?: string; location?: string; notes?: string; thumbnailDataUrl?: string },
 ): SessionRecord {
+  // Outlier filtering: remove snapshots where REBA is a statistical outlier
+  // (>2.5 std deviations from median) — these are tracking artifact frames from fast motion
+  // Only filter if we have enough samples to compute reliable statistics
+  let filteredSnapshots = snapshots;
+  if (snapshots.length >= 10) {
+    const rebaScores = snapshots.map(s => s.reba.score);
+    const sorted = [...rebaScores].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const mean = rebaScores.reduce((a, b) => a + b, 0) / rebaScores.length;
+    const variance = rebaScores.reduce((s, v) => s + (v - mean) ** 2, 0) / rebaScores.length;
+    const stdDev = Math.sqrt(variance);
+    const threshold = 2.5;
+    filteredSnapshots = snapshots.filter(s => Math.abs(s.reba.score - median) <= threshold * stdDev);
+    // Ensure we don't filter out too many frames (keep at least 70%)
+    if (filteredSnapshots.length < snapshots.length * 0.7) filteredSnapshots = snapshots;
+  }
+
   const avg = (fn: (s: ErgoSnapshot) => number) =>
-    snapshots.length ? snapshots.reduce((s, x) => s + fn(x), 0) / snapshots.length : 0;
+    filteredSnapshots.length ? filteredSnapshots.reduce((s, x) => s + fn(x), 0) / filteredSnapshots.length : 0;
 
   const peakRisk = snapshots.reduce<RiskLevel>((max, s) => {
     return RISK_ORDER.indexOf(s.overallRisk) > RISK_ORDER.indexOf(max) ? s.overallRisk : max;

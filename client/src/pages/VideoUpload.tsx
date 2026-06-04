@@ -37,7 +37,7 @@ import { useLocation } from 'wouter';
 import {
   Upload, Film, Play, CheckCircle2, AlertCircle,
   Settings2, ChevronRight, X, FileVideo, ChevronDown, ChevronUp,
-  Pause, Square
+  Pause, Square, StopCircle
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -212,7 +212,7 @@ export default function VideoUpload() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [resultId, setResultId] = useState<string | null>(null);
   const [liveScores, setLiveScores] = useState<{ rula: number; reba: number } | null>(null);
-  const [riskColors, setRiskColors] = useState(false);
+  const [riskColors, setRiskColors] = useState(true); // ON by default — risk colors are the primary value of the overlay
   const [framesAnalyzed, setFramesAnalyzed] = useState(0);
 
   const [assessor, setAssessor] = useState('');
@@ -406,15 +406,28 @@ export default function VideoUpload() {
           const result = poseLandmarkerRef.current.detectForVideo(video, timestampMs);
           if (result?.landmarks?.length > 0) {
             const raw = result.landmarks[0];
-            const smoothed = emaRef.current.smooth(raw);
-            latestLandmarksRef.current = smoothed;
 
-            // Compute segment colors (cheap — just angle math)
-            const { angles } = extractAngles(smoothed);
-            latestSegColorsRef.current = getSegmentColors(angles);
+            // Confidence gating: compute average visibility of key structural landmarks
+            // (shoulders, hips, knees — indices 11,12,23,24,25,26)
+            // If confidence is too low, the tracking has lost the person (fast motion artifact)
+            // Keep the last valid landmarks rather than updating with garbage data
+            const KEY_LM = [11, 12, 23, 24, 25, 26];
+            const avgConf = KEY_LM.reduce((sum, i) => sum + (raw[i]?.visibility ?? 0), 0) / KEY_LM.length;
+
+            if (avgConf >= 0.35) {
+              // Good confidence — update with smoothed landmarks
+              const smoothed = emaRef.current.smooth(raw);
+              latestLandmarksRef.current = smoothed;
+              // Compute segment colors (cheap — just angle math)
+              const { angles } = extractAngles(smoothed);
+              latestSegColorsRef.current = getSegmentColors(angles);
+            }
+            // else: low confidence (fast motion / occlusion) — keep last valid landmarks
+            // The EMA smoother will naturally decay toward the new position once tracking recovers
           } else {
             latestLandmarksRef.current = null;
             latestSegColorsRef.current = null;
+            emaRef.current.reset(); // Reset EMA so it doesn't blend stale data when tracking resumes
           }
         } catch { /* skip frame */ }
       }
@@ -671,20 +684,26 @@ export default function VideoUpload() {
                         </div>
                         <Progress value={progress} className="h-0.5 bg-white/20" />
                       </div>
-                      <Button size="sm" variant="ghost"
-                        className="h-7 px-2 text-white/70 hover:text-white hover:bg-white/10 gap-1 text-xs shrink-0"
+                      <Button size="sm"
+                        className="h-7 px-3 bg-white/20 hover:bg-white/30 text-white border border-white/30 gap-1.5 text-xs shrink-0 font-semibold"
                         onClick={stopAnalysis}>
-                        <Square className="w-3 h-3" /> Finish
+                        <StopCircle className="w-3.5 h-3.5" /> Stop &amp; Finish
                       </Button>
                     </div>
 
                     {/* Risk color toggle — top right */}
                     <button
-                      className={`absolute top-2 right-2 px-2 py-1 rounded text-[10px] font-mono transition-colors ${riskColors ? 'bg-sky-500/80 text-white' : 'bg-black/50 text-white/60 hover:bg-black/70'}`}
+                      className={`absolute top-2 right-2 flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-[11px] font-semibold transition-all shadow-md ${
+                        riskColors
+                          ? 'bg-white/90 text-slate-800 border border-white/60'
+                          : 'bg-black/60 text-white/70 border border-white/20 hover:bg-black/80'
+                      }`}
                       style={{ zIndex: 3 }}
                       onClick={() => setRiskColors(v => !v)}
+                      title={riskColors ? 'Click to show plain skeleton' : 'Click to show risk colors'}
                     >
-                      {riskColors ? '● Risk colors ON' : '○ Risk colors'}
+                      <span className={`w-2 h-2 rounded-full ${riskColors ? 'bg-green-500' : 'bg-slate-400'}`} />
+                      {riskColors ? 'Risk Colors' : 'Plain'}
                     </button>
                   </>
                 )}
