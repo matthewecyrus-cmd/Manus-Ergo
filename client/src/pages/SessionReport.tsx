@@ -24,7 +24,7 @@ import {
 import {
   ArrowLeft, Printer, CheckCircle2, AlertTriangle, ChevronDown, ChevronUp,
   Activity, Zap, TrendingUp, Shield, HelpCircle, Eye, Play, Pause,
-  RotateCcw, GitCompare, TrendingDown, Minus, Circle,
+  RotateCcw, GitCompare, TrendingDown, Minus, Circle, Download,
 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -33,6 +33,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useSession } from '@/contexts/SessionContext';
 import { riskBgClass, riskLabel, riskColor, buildBodyRegions, generateRecommendations, extractAngles } from '@/lib/ergo-engine';
+import { exportSessionPdf } from '@/lib/pdf-export';
 import type { BodyAngles } from '@/lib/ergo-engine';
 import { toast } from 'sonner';
 import type {
@@ -692,6 +693,21 @@ export default function SessionReport() {
     toast.success('Action status updated');
   }, []);
 
+  const [exporting, setExporting] = useState(false);
+  const handleExportPdf = useCallback(async () => {
+    if (!session) return;
+    setExporting(true);
+    try {
+      await exportSessionPdf(session);
+      toast.success('PDF exported successfully');
+    } catch (err) {
+      console.error('PDF export failed:', err);
+      toast.error('PDF export failed. Please try again.');
+    } finally {
+      setExporting(false);
+    }
+  }, [session]);
+
   if (!session) {
     return (
       <div className="p-8 flex flex-col items-center justify-center gap-4 text-center">
@@ -773,6 +789,13 @@ export default function SessionReport() {
           <Badge variant="outline" className="text-xs">{session.source === 'video-upload' ? '📹 Video Upload' : '📷 Live Scan'}</Badge>
           <Button variant="outline" size="sm" onClick={() => window.print()} className="gap-1.5">
             <Printer className="w-3.5 h-3.5" /> Print
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleExportPdf} disabled={exporting} className="gap-1.5">
+            {exporting ? (
+              <><div className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin" /> Exporting…</>
+            ) : (
+              <><Download className="w-3.5 h-3.5" /> Export PDF</>
+            )}
           </Button>
         </div>
       </div>

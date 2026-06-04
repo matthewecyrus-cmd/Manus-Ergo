@@ -70,12 +70,13 @@ export default function LiveScan() {
       const record = stopRecording();
       if (record) {
         toast.success(`Session saved: ${record.id}`, {
-          description: `RULA avg: ${record.avgRula} · REBA avg: ${record.avgReba}`,
+          description: `Duration: ${formatDuration(record.duration)} · Peak risk: ${riskLabel(record.peakRisk)}`,
+          action: { label: 'View Report', onClick: () => navigate(`/sessions/${record.id}`) },
         });
       }
     }
     poseControls.stopCamera();
-  }, [poseControls, isRecording, stopRecording]);
+  }, [poseControls, isRecording, stopRecording, navigate]);
 
   const handleToggleRecording = useCallback(() => {
     if (isRecording) {
