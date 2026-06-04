@@ -48,7 +48,7 @@ import { Slider } from '@/components/ui/slider';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from 'sonner';
 import { useSession, SessionContext } from '@/contexts/SessionContext';
-import { EMAFilter, computeSnapshot, riskLabel, summarizeSession, extractAngles } from '@/lib/ergo-engine';
+import { EMAFilter, computeSnapshot, riskLabel, summarizeSession, extractAngles, resetAngleState } from '@/lib/ergo-engine';
 import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord, BodyAngles } from '@/lib/ergo-engine';
 
 const MEDIAPIPE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
@@ -104,16 +104,27 @@ type Seg = keyof SegColors;
 interface Conn { a: number; b: number; seg: Seg }
 
 const CONNECTIONS: Conn[] = [
+  // Neck / head
   { a:0,  b:11, seg:'neck' },   { a:0,  b:12, seg:'neck' },
+  { a:7,  b:11, seg:'neck' },   { a:8,  b:12, seg:'neck' }, // ear-shoulder
+  // Torso
   { a:11, b:12, seg:'trunk' },  { a:11, b:23, seg:'trunk' },
   { a:12, b:24, seg:'trunk' },  { a:23, b:24, seg:'trunk' },
+  // Upper arms
   { a:11, b:13, seg:'upperArm' }, { a:12, b:14, seg:'upperArm' },
+  // Lower arms
   { a:13, b:15, seg:'lowerArm' }, { a:14, b:16, seg:'lowerArm' },
+  // Hands
   { a:15, b:17, seg:'wrist' },  { a:15, b:19, seg:'wrist' },
   { a:17, b:19, seg:'wrist' },  { a:16, b:18, seg:'wrist' },
   { a:16, b:20, seg:'wrist' },  { a:18, b:20, seg:'wrist' },
+  // Legs
   { a:23, b:25, seg:'legs' },   { a:25, b:27, seg:'legs' },
   { a:24, b:26, seg:'legs' },   { a:26, b:28, seg:'legs' },
+  // Feet
+  { a:27, b:29, seg:'legs' },   { a:28, b:30, seg:'legs' },
+  { a:27, b:31, seg:'legs' },   { a:28, b:32, seg:'legs' },
+  { a:29, b:31, seg:'legs' },   { a:30, b:32, seg:'legs' },
 ];
 
 const JOINT_SEG: Record<number, Seg> = {
@@ -127,6 +138,11 @@ const JOINT_SEG: Record<number, Seg> = {
 };
 
 // ─── Canvas draw — called every decoded frame ─────────────────────────────────
+// NOTE: The video element is visible underneath the canvas (handles rotation correctly).
+// The canvas is transparent — we only draw the skeleton overlay here.
+// Landmark coordinates from MediaPipe are relative to the RAW video frame (videoWidth x videoHeight).
+// The browser displays the video with CSS object-contain, which letterboxes it.
+// We must compute the same letterbox rect to map landmarks to canvas pixels.
 function drawSkeleton(
   ctx: CanvasRenderingContext2D,
   W: number, H: number,
@@ -135,11 +151,23 @@ function drawSkeleton(
   riskColors: boolean,
   segColors: SegColors | null,
 ) {
-  const vW = video.videoWidth  || W;
-  const vH = video.videoHeight || H;
-  const scale = Math.min(W / vW, H / vH);
-  const drawW = vW * scale;
-  const drawH = vH * scale;
+  // Use the video's natural display dimensions (after CSS object-contain letterboxing)
+  // video.videoWidth/Height are the RAW frame dimensions (before browser rotation)
+  // The browser applies the rotation flag when rendering, so the displayed aspect ratio
+  // may be swapped. We detect this by comparing the video element's clientWidth/Height.
+  const rawW = video.videoWidth  || W;
+  const rawH = video.videoHeight || H;
+  // Detect if the browser has rotated the video (portrait video in landscape container)
+  const displayAR = (video.clientWidth || W) / (video.clientHeight || H);
+  const rawAR = rawW / rawH;
+  // If the display AR and raw AR differ significantly, the video is rotated
+  const isRotated = Math.abs(displayAR - rawAR) > 0.3 && Math.abs(displayAR - (1 / rawAR)) < 0.3;
+  // Use the effective display dimensions for letterbox calculation
+  const effW = isRotated ? rawH : rawW;
+  const effH = isRotated ? rawW : rawH;
+  const scale = Math.min(W / effW, H / effH);
+  const drawW = effW * scale;
+  const drawH = effH * scale;
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
 
@@ -220,6 +248,24 @@ export default function VideoUpload() {
   const isRunningRef = useRef(false);
   const riskColorsRef = useRef(riskColors);
   useEffect(() => { riskColorsRef.current = riskColors; }, [riskColors]);
+
+  // Size canvas buffer to match CSS display size on mount and resize
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const sizeCanvas = () => {
+      const w = canvas.offsetWidth;
+      const h = canvas.offsetHeight;
+      if (w > 4 && h > 4 && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+    };
+    sizeCanvas();
+    const ro = new ResizeObserver(sizeCanvas);
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, []);
 
   const handleFile = useCallback((file: File) => {
     if (!file.type.startsWith('video/')) {
@@ -344,10 +390,8 @@ export default function VideoUpload() {
       const H = canvas.height;
       if (W < 4 || H < 4) return;
 
-      // Draw video frame
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, W, H);
-      try { ctx.drawImage(video, 0, 0, W, H); } catch { /* not ready */ }
+      // Canvas is transparent — video element is visible underneath (handles rotation correctly)
+      ctx.clearRect(0, 0, W, H);
 
       // Run MediaPipe VIDEO mode with actual video timestamp
       if (poseLandmarkerRef.current && !video.paused && !video.ended) {
@@ -368,42 +412,47 @@ export default function VideoUpload() {
         } catch { /* skip frame */ }
       }
 
-      // Draw skeleton overlay
+      // Draw skeleton overlay (canvas is transparent, video shows through)
       const lm = latestLandmarksRef.current;
       if (lm && lm.length > 0) {
-        // Correct letterbox mapping
-        const vW = video.videoWidth  || W;
-        const vH = video.videoHeight || H;
-        const scale = Math.min(W / vW, H / vH);
-        const drawW = vW * scale;
-        const drawH = vH * scale;
-        const drawX = (W - drawW) / 2;
-        const drawY = (H - drawH) / 2;
-
-        // Redraw video into letterbox rect (correct aspect ratio)
-        ctx.fillStyle = '#000';
-        ctx.fillRect(0, 0, W, H);
-        try { ctx.drawImage(video, drawX, drawY, drawW, drawH); } catch { /* skip */ }
-
         drawSkeleton(ctx, W, H, video, lm, riskColorsRef.current, latestSegColorsRef.current);
-      } else {
-        // No skeleton — just draw video correctly letterboxed
-        const vW = video.videoWidth  || W;
-        const vH = video.videoHeight || H;
-        const scale = Math.min(W / vW, H / vH);
-        const drawW = vW * scale;
-        const drawH = vH * scale;
-        const drawX = (W - drawW) / 2;
-        const drawY = (H - drawH) / 2;
-        ctx.fillStyle = '#000';
-        ctx.fillRect(0, 0, W, H);
-        try { ctx.drawImage(video, drawX, drawY, drawW, drawH); } catch { /* skip */ }
       }
 
       // Capture thumbnail at 25% of video
+      // Draw video frame + skeleton onto an offscreen canvas for the thumbnail
       if (!thumbnailCapturedRef.current && video.duration > 0 && video.currentTime >= video.duration * 0.25) {
         thumbnailCapturedRef.current = true;
-        thumbnailDataUrlRef.current = canvas.toDataURL('image/jpeg', 0.7);
+        try {
+          const thumb = document.createElement('canvas');
+          thumb.width = W; thumb.height = H;
+          const tCtx = thumb.getContext('2d')!;
+          // Draw video frame (handles rotation via CSS, but drawImage uses raw frame)
+          // Use same letterbox math as the overlay
+          const rawW = video.videoWidth || W;
+          const rawH = video.videoHeight || H;
+          const dispAR = (video.clientWidth || W) / (video.clientHeight || H);
+          const rawAR = rawW / rawH;
+          const rotated = Math.abs(dispAR - rawAR) > 0.3 && Math.abs(dispAR - (1 / rawAR)) < 0.3;
+          const effW = rotated ? rawH : rawW;
+          const effH = rotated ? rawW : rawH;
+          const scale = Math.min(W / effW, H / effH);
+          const dW = effW * scale; const dH = effH * scale;
+          const dX = (W - dW) / 2; const dY = (H - dH) / 2;
+          tCtx.fillStyle = '#000';
+          tCtx.fillRect(0, 0, W, H);
+          if (rotated) {
+            tCtx.save();
+            tCtx.translate(W / 2, H / 2);
+            tCtx.rotate(-Math.PI / 2);
+            tCtx.drawImage(video, -dH / 2, -dW / 2, dH, dW);
+            tCtx.restore();
+          } else {
+            tCtx.drawImage(video, dX, dY, dW, dH);
+          }
+          // Composite skeleton overlay on top
+          tCtx.drawImage(canvas, 0, 0);
+          thumbnailDataUrlRef.current = thumb.toDataURL('image/jpeg', 0.7);
+        } catch { /* skip thumbnail */ }
       }
 
       // Schedule next frame
@@ -435,16 +484,12 @@ export default function VideoUpload() {
   }, []);
 
   const startReportSampler = useCallback((video: HTMLVideoElement) => {
-    // Sample at 500ms intervals — update React state and collect snapshots
+      // Sample at 250ms intervals — update React state and collect snapshots
     reportIntervalRef.current = setInterval(() => {
       if (!isRunningRef.current || video.paused || video.ended) return;
-
       const lm = latestLandmarksRef.current;
       if (!lm) return;
-
-      const now = Date.now();
-      if (now - lastReportTimeRef.current < 450) return; // debounce
-      lastReportTimeRef.current = now;
+      lastReportTimeRef.current = Date.now();
 
       const snap = computeSnapshot(lm, taskProfileRef.current);
       if (snap) {
@@ -455,7 +500,7 @@ export default function VideoUpload() {
           setProgress(Math.round((video.currentTime / video.duration) * 100));
         }
       }
-    }, 500);
+    }, 250);
   }, []);
 
   const analyzeVideo = useCallback(async () => {
@@ -485,6 +530,7 @@ export default function VideoUpload() {
     if (w > 4 && h > 4) { canvas.width = w; canvas.height = h; }
 
     emaRef.current.reset();
+    resetAngleState(); // clear hold-last-valid state from any previous session
     isRunningRef.current = true;
     setAnalysisState('analyzing');
 
@@ -574,20 +620,17 @@ export default function VideoUpload() {
 
               {/*
                 VIDEO + CANVAS CONTAINER
-                canvas is always in DOM (never display:none) — opacity toggle only
-                During analysis: canvas on top (opacity 1), video hidden (opacity 0)
-                Before/after: video visible with controls, canvas hidden
+                Video is ALWAYS visible (handles rotation correctly via browser CSS).
+                Canvas is transparent overlay on top — only draws skeleton lines.
+                During analysis: canvas visible (opacity 1), video controls hidden.
+                Before/after: video visible with controls, canvas hidden (opacity 0).
               */}
               <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
                 <video
                   ref={videoRef}
                   src={videoUrl ?? undefined}
                   className="absolute inset-0 w-full h-full object-contain"
-                  style={{
-                    zIndex: 1,
-                    opacity: isAnalyzing ? 0 : 1,
-                    pointerEvents: isAnalyzing ? 'none' : 'auto',
-                  }}
+                  style={{ zIndex: 1, pointerEvents: isAnalyzing ? 'none' : 'auto' }}
                   controls={!isAnalyzing}
                   preload="auto"
                   playsInline
@@ -600,6 +643,7 @@ export default function VideoUpload() {
                     zIndex: 2,
                     pointerEvents: 'none',
                     opacity: isAnalyzing ? 1 : 0,
+                    background: 'transparent',
                   }}
                 />
 

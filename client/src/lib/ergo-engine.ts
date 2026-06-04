@@ -380,10 +380,10 @@ export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: numb
   // +1 if shoulder is abducted ≥45° (arm raised out to side)
   if (Math.max(a.leftShoulderAbduction ?? 0, a.rightShoulderAbduction ?? 0) >= 45) upperArm += 1;
 
-  // Lower arm score (RULA Table 2)
-  let lowerArm = 1;
-  const la = Math.min(a.leftLowerArm, a.rightLowerArm); // elbow angle
-  if (la < 60 || la > 100) lowerArm = 2;
+  // Lower arm score (RULA Table 2) — use WORST arm (most deviated from 60-100° range)
+  const laWorst = Math.abs(a.leftLowerArm - 80) >= Math.abs(a.rightLowerArm - 80)
+    ? a.leftLowerArm : a.rightLowerArm;
+  let lowerArm = (laWorst >= 60 && laWorst <= 100) ? 1 : 2;
   // +1 if forearm crosses midline
   if (Math.max(a.leftForearmCross ?? 0, a.rightForearmCross ?? 0) > 15) lowerArm = Math.min(3, lowerArm + 1);
 
@@ -414,10 +414,20 @@ export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: numb
   // Force/load modifier
   const forceScore = task.loadWeight > 10 ? 3 : task.loadWeight > 2 ? 2 : 0;
 
-  // RULA table lookup (simplified validated formula)
-  const armWristScore = Math.min(7, upperArm + lowerArm + wrist + muscleScore + forceScore);
-  const neckTrunkScore = Math.min(7, neck + trunk + muscleScore + forceScore);
-  const grandScore = Math.min(7, Math.round((armWristScore + neckTrunkScore) / 2) + 1);
+  // RULA Table A (arm+wrist group) and Table B (neck+trunk+leg group)
+  const armWristScore = Math.min(7, Math.max(1, upperArm + lowerArm + wrist + muscleScore + forceScore));
+  const neckTrunkScore = Math.min(7, Math.max(1, neck + trunk + muscleScore + forceScore));
+  // RULA Table C — validated 7×7 lookup (McAtamney & Corlett 1993)
+  const RULA_TABLE_C: number[][] = [
+    [1, 2, 3, 3, 4, 5, 5], // aws=1
+    [2, 2, 3, 4, 4, 5, 5], // aws=2
+    [3, 3, 3, 4, 4, 5, 6], // aws=3
+    [3, 3, 3, 4, 5, 6, 6], // aws=4
+    [4, 4, 4, 5, 6, 7, 7], // aws=5
+    [4, 4, 5, 6, 6, 7, 7], // aws=6
+    [5, 5, 6, 6, 7, 7, 7], // aws=7
+  ];
+  const grandScore = RULA_TABLE_C[armWristScore - 1][neckTrunkScore - 1];
 
   let actionLevel = 1;
   if (grandScore >= 7) actionLevel = 4;
@@ -464,8 +474,8 @@ export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: numb
   if (a.trunkLateral > 10) trunk += 1;
   if (a.trunkRotation > 15) trunk += 1;
 
-  // Legs (simplified — use knee angle as proxy)
-  const kneeAngle = Math.max(a.leftKnee, a.rightKnee);
+  // Legs — use WORST (most bent) knee. Included angle: 180°=straight, 90°=deep squat.
+  const kneeAngle = Math.min(a.leftKnee, a.rightKnee); // smallest = most bent = worst
   let legs = 1;
   if (kneeAngle < 150) legs = 2; // bent
   if (kneeAngle < 120) legs = 3; // deeply bent
@@ -479,9 +489,10 @@ export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: numb
   // +1 if shoulder is abducted ≥45°
   if (Math.max(a.leftShoulderAbduction ?? 0, a.rightShoulderAbduction ?? 0) >= 45) upperArm += 1;
 
-  // Lower arm
-  const la = Math.min(a.leftLowerArm, a.rightLowerArm);
-  const lowerArm = (la >= 60 && la <= 100) ? 1 : 2;
+  // Lower arm — use WORST arm (most deviated from 60-100° range)
+  const laWorstReba = Math.abs(a.leftLowerArm - 80) >= Math.abs(a.rightLowerArm - 80)
+    ? a.leftLowerArm : a.rightLowerArm;
+  const lowerArm = (laWorstReba >= 60 && laWorstReba <= 100) ? 1 : 2;
 
   // Wrist
   const wr = Math.max(a.leftWrist, a.rightWrist);

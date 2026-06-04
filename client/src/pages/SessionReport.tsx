@@ -297,18 +297,22 @@ function drawReplayFrame(
   riskColors: boolean,
   segColors: SegColors | null,
 ) {
-  const vW = video.videoWidth  || W;
-  const vH = video.videoHeight || H;
-  const scale = Math.min(W / vW, H / vH);
-  const drawW = vW * scale;
-  const drawH = vH * scale;
+  // Canvas is transparent — video element shows through (handles rotation correctly)
+  ctx.clearRect(0, 0, W, H);
+
+  // Rotation-aware letterbox: detect if browser has rotated the video
+  const rawW = video.videoWidth  || W;
+  const rawH = video.videoHeight || H;
+  const displayAR = (video.clientWidth || W) / (video.clientHeight || H);
+  const rawAR = rawW / rawH;
+  const isRotated = Math.abs(displayAR - rawAR) > 0.3 && Math.abs(displayAR - (1 / rawAR)) < 0.3;
+  const effW = isRotated ? rawH : rawW;
+  const effH = isRotated ? rawW : rawH;
+  const scale = Math.min(W / effW, H / effH);
+  const drawW = effW * scale;
+  const drawH = effH * scale;
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
-
-  // Draw video frame with correct aspect ratio
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, W, H);
-  try { ctx.drawImage(video, drawX, drawY, drawW, drawH); } catch { /* not ready */ }
 
   const CONF = 0.25;
   const lw = Math.min(2, Math.max(1.5, drawW / 400));
@@ -545,9 +549,10 @@ function VideoReplay({ session }: { session: SessionRecord }) {
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
-          {/* Video is hidden — canvas draws the video frame + skeleton */}
-          <video ref={videoRef} src={videoUrl} className="absolute inset-0 w-full h-full" style={{ opacity: 0, pointerEvents: 'none' }} muted preload="auto" playsInline />
-          <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ display: 'block' }} />
+          {/* Video always visible — handles rotation correctly via browser CSS */}
+          <video ref={videoRef} src={videoUrl} className="absolute inset-0 w-full h-full object-contain" style={{ zIndex: 1, pointerEvents: 'none' }} muted preload="auto" playsInline />
+          {/* Canvas is transparent overlay — only draws skeleton lines */}
+          <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ zIndex: 2, display: 'block', background: 'transparent' }} />
           <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-4 py-3">
             <div className="flex items-center gap-3">
               <button onClick={togglePlay} className="w-8 h-8 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center transition-colors">

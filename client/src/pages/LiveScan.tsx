@@ -42,6 +42,25 @@ export default function LiveScan() {
     poseControls.setTaskProfile(taskProfile);
   }, [taskProfile, poseControls]);
 
+  // Size canvas buffer to match its CSS display size (once on mount + on resize)
+  // Canvas defaults to 300x150 buffer — must match offsetWidth/Height for correct overlay
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const sizeCanvas = () => {
+      const w = canvas.offsetWidth;
+      const h = canvas.offsetHeight;
+      if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+    };
+    sizeCanvas();
+    const ro = new ResizeObserver(sizeCanvas);
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, []);
+
   const handleStartCamera = useCallback(async () => {
     await poseControls.startCamera();
   }, [poseControls]);
@@ -139,8 +158,8 @@ export default function LiveScan() {
           />
           <canvas
             ref={canvasRef}
-            className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-            style={{ transform: 'scaleX(-1)' }}
+            className="absolute inset-0 w-full h-full pointer-events-none"
+            style={{ transform: 'scaleX(-1)', background: 'transparent' }}
           />
 
           {/* Idle overlay */}

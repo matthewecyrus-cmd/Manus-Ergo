@@ -9,7 +9,7 @@
  */
 import { useRef, useState, useCallback, useEffect } from 'react';
 import type { Landmarks, ErgoSnapshot } from '@/lib/ergo-engine';
-import { EMAFilter, computeSnapshot, DEFAULT_TASK_PROFILE } from '@/lib/ergo-engine';
+import { EMAFilter, computeSnapshot, DEFAULT_TASK_PROFILE, resetAngleState } from '@/lib/ergo-engine';
 import type { TaskProfile } from '@/lib/ergo-engine';
 
 // MediaPipe CDN for WASM + model (offline: swap to local /public path)
@@ -168,6 +168,7 @@ export function usePoseDetection(
         await video.play();
       }
       emaFilterRef.current.reset();
+      resetAngleState(); // clear hold-last-valid state from any previous session
       runningRef.current = true;
       setStatus('running');
       rafRef.current = requestAnimationFrame(detectLoop);
@@ -293,13 +294,17 @@ function drawSkeleton(
 
   const cW = canvas.width  || canvas.offsetWidth  || 640;
   const cH = canvas.height || canvas.offsetHeight || 480;
-  const vW = video.videoWidth  || 640;
-  const vH = video.videoHeight || 480;
-
-  const lb = letterboxRectLive(cW, cH, vW, vH);
+  const rawW = video.videoWidth  || 640;
+  const rawH = video.videoHeight || 480;
+  // Rotation-aware letterbox: detect if browser has rotated the video
+  const displayAR = (video.clientWidth || cW) / (video.clientHeight || cH);
+  const rawAR = rawW / rawH;
+  const isRotated = Math.abs(displayAR - rawAR) > 0.3 && Math.abs(displayAR - (1 / rawAR)) < 0.3;
+  const effW = isRotated ? rawH : rawW;
+  const effH = isRotated ? rawW : rawH;
+  // Canvas is transparent — video element is visible underneath (handles rotation correctly)
+  const lb = letterboxRectLive(cW, cH, effW, effH);
   ctx.clearRect(0, 0, cW, cH);
-  // Draw the live video frame
-  ctx.drawImage(video, lb.x, lb.y, lb.w, lb.h);
 
   const colorMap = buildLiveColors(lm);
   const px = (lmx: number) => lb.x + lmx * lb.w;
