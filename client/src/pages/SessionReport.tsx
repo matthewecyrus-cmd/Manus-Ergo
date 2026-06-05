@@ -587,12 +587,29 @@ function VideoReplay({ session }: { session: SessionRecord }) {
         setVideoAspect(`${v.videoWidth} / ${v.videoHeight}`);
       }
       sizeCanvas();
-      setTimeout(() => drawFrame(), 100);
+    };
+    const onCanPlay = () => {
+      // Video has decoded enough to render — now draw the first frame
+      sizeCanvas();
+      setTimeout(() => drawFrame(), 50);
+    };
+    const onSeeked = () => {
+      // After a seek (e.g. restart), redraw the new frame with skeleton
+      sizeCanvas();
+      drawFrame();
     };
     const onEnd = () => { setPlaying(false); stopLoop(); };
     v.addEventListener('loadedmetadata', onMeta);
+    v.addEventListener('canplay', onCanPlay);
+    v.addEventListener('seeked', onSeeked);
     v.addEventListener('ended', onEnd);
-    return () => { v.removeEventListener('loadedmetadata', onMeta); v.removeEventListener('ended', onEnd); stopLoop(); };
+    return () => {
+      v.removeEventListener('loadedmetadata', onMeta);
+      v.removeEventListener('canplay', onCanPlay);
+      v.removeEventListener('seeked', onSeeked);
+      v.removeEventListener('ended', onEnd);
+      stopLoop();
+    };
   }, [drawFrame, stopLoop, sizeCanvas]);
 
   if (!videoUrl) {
@@ -626,12 +643,13 @@ function VideoReplay({ session }: { session: SessionRecord }) {
         <p className="text-xs text-muted-foreground">The colored skeleton shows the AI's joint tracking. Green = safe, amber = caution, red = high risk.</p>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="relative rounded-xl overflow-hidden bg-black w-full max-h-[70vh]" style={{ aspectRatio: videoAspect }}>
+        <div className="flex justify-center w-full">
+        <div className="relative rounded-xl overflow-hidden bg-black" style={{ aspectRatio: videoAspect, maxHeight: '70vh', width: '100%', maxWidth: `calc(70vh * (${videoAspect.replace(' / ', '/')}))` }}>
           {/* Video always visible — handles rotation correctly via browser CSS */}
           <video ref={videoRef} src={videoUrl} className="absolute inset-0 w-full h-full object-contain" style={{ zIndex: 1, pointerEvents: 'none' }} muted preload="auto" playsInline />
           {/* Canvas is transparent overlay — only draws skeleton lines */}
           <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ zIndex: 2, display: 'block', background: 'transparent' }} />
-          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-4 py-3">
+          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-4 py-3" style={{ zIndex: 3 }}>
             <div className="flex items-center gap-3">
               <button onClick={togglePlay} className="w-8 h-8 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center transition-colors">
                 {playing ? <Pause className="w-4 h-4 text-white" /> : <Play className="w-4 h-4 text-white" />}
@@ -646,6 +664,7 @@ function VideoReplay({ session }: { session: SessionRecord }) {
               <span className="text-white/80 text-xs font-mono shrink-0">{fmt(currentTime)} / {fmt(duration)}</span>
             </div>
           </div>
+        </div>
         </div>
         <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5"><span className="w-3 h-0.5 bg-green-500 inline-block" /> Safe</span>

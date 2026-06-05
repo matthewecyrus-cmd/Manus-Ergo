@@ -373,25 +373,29 @@ export default function VideoUpload() {
     setAnalysisState('done');
     setProgress(100);
 
-    // Seek back to frame 0 so the video shows the first frame (not a black end-of-video frame)
-    // Must wait for 'seeked' event — setting currentTime is async on mobile browsers
+    // Seek back to frame 0 and draw the first snapshot's skeleton as a "done" state
     if (video) {
-      const clearAndSeek = () => {
-        // Clear the canvas overlay so the skeleton doesn't linger after analysis
+      const drawFinalFrame = () => {
         const canvas = canvasRef.current;
-        if (canvas) {
-          const ctx = canvas.getContext('2d');
-          if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
-        }
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        const W = canvas.width || canvas.offsetWidth;
+        const H = canvas.height || canvas.offsetHeight;
+        // Find the snapshot closest to t=0 to show as the final overlay
+        const firstSnap = snapshotsRef.current.slice().sort((a, b) => a.timestamp - b.timestamp)[0];
+        const lm = firstSnap?.landmarks ?? latestLandmarksRef.current ?? [];
+        const segColors = latestSegColorsRef.current;
+        drawSkeleton(ctx, W, H, video, lm, true, segColors);
       };
       video.currentTime = 0;
       const onSeeked = () => {
         video.removeEventListener('seeked', onSeeked);
-        clearAndSeek();
+        drawFinalFrame();
       };
       video.addEventListener('seeked', onSeeked);
-      // Fallback: clear canvas after 500ms regardless
-      setTimeout(clearAndSeek, 500);
+      // Fallback: draw after 600ms regardless
+      setTimeout(drawFinalFrame, 600);
     }
 
     // Persist video blob to IDB (fire-and-forget — don't block UI)
