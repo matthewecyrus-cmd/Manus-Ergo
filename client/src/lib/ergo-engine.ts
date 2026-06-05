@@ -138,9 +138,14 @@ export const VISIBILITY_THRESHOLD = 0.65;
  */
 export class EMAFilter {
   private state: Record<number, Landmark> = {};
+  // MAX_JUMP: maximum allowed normalized displacement per frame (0.0–1.0 of frame width)
+  // Landmarks that jump more than this are clamped to prevent "shooting off" artifacts
+  // during fast motion where MediaPipe returns spurious high-confidence predictions
+  private readonly MAX_JUMP = 0.18;
+
   constructor(private alpha: number = 0.25) {}
 
-  /** Apply EMA to a full landmarks array. Returns smoothed copy. */
+  /** Apply EMA with velocity clamping to a full landmarks array. Returns smoothed copy. */
   smooth(raw: Landmarks): Landmarks {
     return raw.map((lm, i) => {
       const prev = this.state[i];
@@ -148,9 +153,22 @@ export class EMAFilter {
         this.state[i] = { ...lm };
         return { ...lm };
       }
+
+      // Velocity clamp: limit how far a landmark can move in one frame
+      // This suppresses tracking jump artifacts during fast motion
+      const dx = lm.x - prev.x;
+      const dy = lm.y - prev.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      let cx = lm.x, cy = lm.y;
+      if (dist > this.MAX_JUMP) {
+        const scale = this.MAX_JUMP / dist;
+        cx = prev.x + dx * scale;
+        cy = prev.y + dy * scale;
+      }
+
       const smoothed: Landmark = {
-        x: this.alpha * lm.x + (1 - this.alpha) * prev.x,
-        y: this.alpha * lm.y + (1 - this.alpha) * prev.y,
+        x: this.alpha * cx + (1 - this.alpha) * prev.x,
+        y: this.alpha * cy + (1 - this.alpha) * prev.y,
         z: this.alpha * lm.z + (1 - this.alpha) * prev.z,
         visibility: lm.visibility,
       };

@@ -226,7 +226,9 @@ export default function VideoUpload() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const poseLandmarkerRef = useRef<any>(null);
-  const emaRef = useRef(new EMAFilter(0.5));
+  // EMA alpha 0.45: responsive enough to track normal movement, but with velocity clamping
+  // in EMAFilter to prevent landmark jump artifacts during fast motion
+  const emaRef = useRef(new EMAFilter(0.45));
   const taskProfileRef = useRef<TaskProfile>(taskProfile);
 
   // Refs for the overlay loop — no React state updates per frame
@@ -370,8 +372,27 @@ export default function VideoUpload() {
     setResultId(record.id);
     setAnalysisState('done');
     setProgress(100);
+
     // Seek back to frame 0 so the video shows the first frame (not a black end-of-video frame)
-    if (video) { video.currentTime = 0; }
+    // Must wait for 'seeked' event — setting currentTime is async on mobile browsers
+    if (video) {
+      const clearAndSeek = () => {
+        // Clear the canvas overlay so the skeleton doesn't linger after analysis
+        const canvas = canvasRef.current;
+        if (canvas) {
+          const ctx = canvas.getContext('2d');
+          if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+      };
+      video.currentTime = 0;
+      const onSeeked = () => {
+        video.removeEventListener('seeked', onSeeked);
+        clearAndSeek();
+      };
+      video.addEventListener('seeked', onSeeked);
+      // Fallback: clear canvas after 500ms regardless
+      setTimeout(clearAndSeek, 500);
+    }
 
     // Persist video blob to IDB (fire-and-forget — don't block UI)
     if (videoFile) {
@@ -527,6 +548,20 @@ export default function VideoUpload() {
     snapshotsRef.current = [];
     thumbnailCapturedRef.current = false;
     thumbnailDataUrlRef.current = undefined;
+
+    // Seek to frame 0 immediately so the video shows the first frame during model loading
+    // (not a black screen from wherever the user left the scrubber)
+    const videoEl = videoRef.current;
+    if (videoEl) {
+      videoEl.currentTime = 0;
+      // Wait for seek to complete so the frame is visible during loading
+      await new Promise<void>(resolve => {
+        const onSeeked = () => { videoEl.removeEventListener('seeked', onSeeked); resolve(); };
+        videoEl.addEventListener('seeked', onSeeked);
+        // Fallback timeout in case seeked never fires (e.g. already at 0)
+        setTimeout(resolve, 300);
+      });
+    }
 
     try { await loadModel(); } catch {
       setErrorMsg('Failed to load pose detection model. Check your internet connection.');
