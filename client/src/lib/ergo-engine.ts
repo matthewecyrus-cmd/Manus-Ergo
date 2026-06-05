@@ -289,7 +289,10 @@ export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidenc
       const headVec = sub(nose, midShoulder);
       const headInPlane = projectOntoPlane(headVec, frame.right); // sagittal plane
       const headLateral = projectOntoPlane(headVec, frame.forward); // frontal plane
-      neckFlexion = (Math.atan2(dot(headInPlane, frame.forward), dot(headInPlane, frame.up)) * 180) / Math.PI;
+      // Positive = head forward (flexion), negative = head back (extension).
+      // REBA/RULA only penalise forward flexion; clamp to [0, 90].
+      const rawNeckFlex = (Math.atan2(dot(headInPlane, frame.forward), dot(headInPlane, frame.up)) * 180) / Math.PI;
+      neckFlexion = Math.min(90, Math.max(0, rawNeckFlex));
       neckLateral = Math.abs((Math.atan2(dot(headLateral, frame.right), dot(headLateral, frame.up)) * 180) / Math.PI);
     }
   }
@@ -363,16 +366,22 @@ export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidenc
   const leftLowerArm  = safeAngle(MP.LEFT_SHOULDER,  MP.LEFT_ELBOW,  MP.LEFT_WRIST,  prev?.leftLowerArm  ?? 90);
   const rightLowerArm = safeAngle(MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, MP.RIGHT_WRIST, prev?.rightLowerArm ?? 90);
 
-  // Wrist deviation
-  const leftWrist  = safeAngle(MP.LEFT_ELBOW,  MP.LEFT_WRIST,  MP.LEFT_INDEX,  prev?.leftWrist  ?? 0);
-  const rightWrist = safeAngle(MP.RIGHT_ELBOW, MP.RIGHT_WRIST, MP.RIGHT_INDEX, prev?.rightWrist ?? 0);
+  // Wrist deviation from neutral (0° = straight wrist, 90° = fully flexed/extended)
+  // angleBetween returns the included angle at the wrist joint (180° = straight).
+  // Deviation = 180° - included_angle, so a straight wrist correctly scores 0°.
+  const _lwRaw = safeAngle(MP.LEFT_ELBOW,  MP.LEFT_WRIST,  MP.LEFT_INDEX,  180 - (prev?.leftWrist  ?? 0));
+  const _rwRaw = safeAngle(MP.RIGHT_ELBOW, MP.RIGHT_WRIST, MP.RIGHT_INDEX, 180 - (prev?.rightWrist ?? 0));
+  const leftWrist  = Math.max(0, 180 - _lwRaw);
+  const rightWrist = Math.max(0, 180 - _rwRaw);
 
   // Knee angles
   const leftKnee  = safeAngle(MP.LEFT_HIP,  MP.LEFT_KNEE,  MP.LEFT_ANKLE,  prev?.leftKnee  ?? 180);
   const rightKnee = safeAngle(MP.RIGHT_HIP, MP.RIGHT_KNEE, MP.RIGHT_ANKLE, prev?.rightKnee ?? 180);
 
-  // Hip flexion
-  const hipFlexion = safeAngle(MP.LEFT_SHOULDER, MP.LEFT_HIP, MP.LEFT_KNEE, prev?.hipFlexion ?? 180);
+  // Hip flexion: deviation from straight (0° = upright standing, 90° = sitting)
+  // safeAngle returns included angle (180° = straight). Flexion = 180° - included.
+  const _hipRaw = safeAngle(MP.LEFT_SHOULDER, MP.LEFT_HIP, MP.LEFT_KNEE, 180 - (prev?.hipFlexion ?? 0));
+  const hipFlexion = Math.max(0, 180 - _hipRaw);
 
   // Average confidence of key joints
   const keyJoints = [
@@ -518,9 +527,10 @@ export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: numb
 export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: number): ScoreResult {
   const a = angles;
 
-  // Neck
+  // Neck (REBA: 1 = 0–20°, 2 = >20° or extension)
+  // neckFlexion is now clamped to [0,90] so extension (negative) can't occur here.
   let neck = 1;
-  if (a.neckFlexion > 20 || a.neckFlexion < 0) neck = 2;
+  if (a.neckFlexion > 20) neck = 2;
   if (a.neckLateral > 10) neck += 1;
 
   // Trunk (REBA Table A — floor is 1 for 0–10°, neutral upright = no penalty)
@@ -532,11 +542,15 @@ export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: numb
   if (a.trunkLateral > 10) trunk += 1;
   if (a.trunkRotation > 15) trunk += 1;
 
-  // Legs — use WORST (most bent) knee. Included angle: 180°=straight, 90°=deep squat.
-  const kneeAngle = Math.min(a.leftKnee, a.rightKnee); // smallest = most bent = worst
-  let legs = 1;
-  if (kneeAngle < 150) legs = 2; // bent
-  if (kneeAngle < 120) legs = 3; // deeply bent
+  // Legs (REBA Table A legs score 1–4)
+  // Knee angles are included angles: 180°=straight, <180°=bent.
+  // Use worst (most bent) knee.
+  const kneeAngle = Math.min(a.leftKnee, a.rightKnee);
+  let legs = 1; // bilateral weight-bearing, legs straight
+  if (kneeAngle < 150) legs = 2; // knee bent 30–60°
+  if (kneeAngle < 120) legs = 3; // knee bent >60°
+  // +1 if hip is flexed >60° (walking, stooping, one-legged stance)
+  if (a.hipFlexion > 60) legs = Math.min(4, legs + 1);
 
   // Upper arm (REBA Table B)
   const ua = Math.max(a.leftUpperArm, a.rightUpperArm);

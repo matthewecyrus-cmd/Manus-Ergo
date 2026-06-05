@@ -13,6 +13,7 @@ import Sessions from "./pages/Sessions";
 import SessionReport from "./pages/SessionReport";
 import VideoUpload from "./pages/VideoUpload";
 import Settings from "./pages/Settings";
+import Reports from "./pages/Reports";
 
 function Router() {
   return (
@@ -25,6 +26,7 @@ function Router() {
         <Route path="/sessions/:id" component={SessionReport} />
         <Route path="/upload" component={VideoUpload} />
         <Route path="/settings" component={Settings} />
+        <Route path="/reports" component={Reports} />
         <Route path="/404" component={NotFound} />
         <Route component={NotFound} />
       </Switch>

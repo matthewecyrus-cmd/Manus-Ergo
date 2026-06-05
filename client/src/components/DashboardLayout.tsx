@@ -8,7 +8,7 @@ import { Link, useLocation } from 'wouter';
 import {
   LayoutDashboard, Settings2, Camera, ClipboardList,
   Activity, Wifi, WifiOff, Menu, X, ChevronLeft, ChevronRight,
-  Film, Cog,
+  Film, Cog, FileText,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useSession } from '@/contexts/SessionContext';
@@ -19,6 +19,7 @@ const NAV_ITEMS = [
   { href: '/scan', label: 'Live Scan', icon: Camera },
   { href: '/upload', label: 'Upload Video', icon: Film },
   { href: '/sessions', label: 'Sessions', icon: ClipboardList },
+  { href: '/reports', label: 'Reports', icon: FileText },
   { href: '/settings', label: 'Settings', icon: Cog },
 ];
 
