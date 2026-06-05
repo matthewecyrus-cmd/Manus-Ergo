@@ -148,10 +148,12 @@ function RiskBadge({ level }: { level: RiskLevel }) {
 }
 
 // ─── Score card with expandable explainer ────────────────────────────────────
-function ScoreCard({ type, score, riskLevel }: {
+function ScoreCard({ type, score, riskLevel, isPeak, notApplicable }: {
   type: keyof typeof SCORE_EXPLAINERS;
   score: number;
   riskLevel: RiskLevel;
+  isPeak?: boolean;
+  notApplicable?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const exp = SCORE_EXPLAINERS[type];
@@ -168,6 +170,9 @@ function ScoreCard({ type, score, riskLevel }: {
               <div className="flex items-center gap-2">
                 <span className="text-lg">{exp.icon}</span>
                 <span className="font-bold text-foreground">{exp.name}</span>
+                {isPeak && (
+                  <span className="text-[10px] font-semibold bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-full">PEAK</span>
+                )}
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <button className="text-muted-foreground hover:text-foreground transition-colors">
@@ -183,10 +188,17 @@ function ScoreCard({ type, score, riskLevel }: {
             </div>
             <RiskBadge level={riskLevel} />
           </div>
+          {notApplicable ? (
+            <div className="flex items-center gap-2 mb-3 py-2 px-3 bg-slate-50 rounded-lg border border-slate-200">
+              <span className="text-2xl font-black text-slate-400 leading-none">N/A</span>
+              <span className="text-xs text-slate-500 leading-tight">Not applicable for this task type. Configure task parameters to enable.</span>
+            </div>
+          ) : (
           <div className="flex items-end gap-3 mb-3">
-            <span className="text-4xl font-black text-foreground leading-none">{score.toFixed(1)}</span>
+            <span className="text-4xl font-black text-foreground leading-none">{isPeak ? score.toString() : score.toFixed(1)}</span>
             <span className={`text-sm font-semibold pb-1 ${action.color}`}>{action.label}</span>
           </div>
+          )}
           <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
             <div className="h-full rounded-full transition-all duration-700" style={{ width: `${pct}%`, backgroundColor: barColor }} />
           </div>
@@ -825,11 +837,15 @@ export default function SessionReport() {
   const openActions = actions.filter(a => a.status === 'open' || a.status === 'in-progress');
   const doneActions = actions.filter(a => a.status === 'completed' || a.status === 'verified');
 
-  // Score risk levels
-  const rulaRisk: RiskLevel = session.avgRula >= 7 ? 'very-high' : session.avgRula >= 5 ? 'high' : session.avgRula >= 3 ? 'medium' : 'low';
-  const rebaRisk: RiskLevel = session.avgReba >= 11 ? 'very-high' : session.avgReba >= 8 ? 'high' : session.avgReba >= 4 ? 'medium' : session.avgReba >= 2 ? 'low' : 'negligible';
-  const nioshRisk: RiskLevel = session.avgNiosh >= 2 ? 'high' : session.avgNiosh >= 1 ? 'medium' : 'low';
-  const rsiRisk: RiskLevel = session.avgRsi >= 40 ? 'high' : session.avgRsi >= 20 ? 'medium' : 'low';
+  // Score risk levels — use PEAK integer scores for RULA/REBA (methodologically correct for ordinal scales)
+  const peakRula = session.peakRula ?? Math.round(session.avgRula);
+  const peakReba = session.peakReba ?? Math.round(session.avgReba);
+  const rulaRisk: RiskLevel = peakRula >= 7 ? 'very-high' : peakRula >= 5 ? 'high' : peakRula >= 3 ? 'medium' : 'low';
+  const rebaRisk: RiskLevel = peakReba >= 11 ? 'very-high' : peakReba >= 8 ? 'high' : peakReba >= 4 ? 'medium' : peakReba >= 2 ? 'low' : 'negligible';
+  const nioshNA = session.avgNiosh === 0 && session.taskProfile?.loadWeight === 0;
+  const rsiNA = session.avgRsi === 0 && (session.taskProfile?.repRate ?? 0) < 2;
+  const nioshRisk: RiskLevel = nioshNA ? 'negligible' : session.avgNiosh >= 2 ? 'high' : session.avgNiosh >= 1 ? 'medium' : 'low';
+  const rsiRisk: RiskLevel = rsiNA ? 'negligible' : session.avgRsi >= 40 ? 'high' : session.avgRsi >= 20 ? 'medium' : 'low';
 
   return (
     <div className="p-4 md:p-6 max-w-5xl mx-auto space-y-6 print:p-4">
@@ -902,10 +918,10 @@ export default function SessionReport() {
           <span className="text-xs font-normal text-muted-foreground ml-1">Click "What does this score mean?" on any card to learn more</span>
         </h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <ScoreCard type="rula" score={session.avgRula} riskLevel={rulaRisk} />
-          <ScoreCard type="reba" score={session.avgReba} riskLevel={rebaRisk} />
-          <ScoreCard type="niosh" score={session.avgNiosh} riskLevel={nioshRisk} />
-          <ScoreCard type="rsi" score={session.avgRsi} riskLevel={rsiRisk} />
+          <ScoreCard type="rula" score={peakRula} riskLevel={rulaRisk} isPeak />
+          <ScoreCard type="reba" score={peakReba} riskLevel={rebaRisk} isPeak />
+          <ScoreCard type="niosh" score={session.avgNiosh} riskLevel={nioshRisk} notApplicable={nioshNA} />
+          <ScoreCard type="rsi" score={session.avgRsi} riskLevel={rsiRisk} notApplicable={rsiNA} />
         </div>
       </div>
 

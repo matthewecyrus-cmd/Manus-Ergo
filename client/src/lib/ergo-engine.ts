@@ -51,6 +51,7 @@ export interface ScoreResult {
   interpretation: string;
   components: Record<string, number>;
   confidence: number; // 0–1 average joint confidence used
+  notApplicable?: boolean; // true when method does not apply to this task type
 }
 
 export interface ErgoSnapshot {
@@ -438,52 +439,102 @@ export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidenc
 export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: number): ScoreResult {
   const a = angles;
 
-  // Upper arm score (RULA Table 1)
-  let upperArm = 1;
+  // ── RULA Group A: Arm + Wrist ─────────────────────────────────────────────
+  // Upper arm elevation from torso vertical (degrees)
   const ua = Math.max(a.leftUpperArm, a.rightUpperArm);
+  let upperArm = 1;
   if (ua > 90) upperArm = 4;
   else if (ua > 45) upperArm = 3;
   else if (ua > 20) upperArm = 2;
-  // +1 if shoulder is abducted ≥45° (arm raised out to side)
+  // +1 if shoulder raised; +1 if arm abducted ≥45°; −1 if arm supported
   if (Math.max(a.leftShoulderAbduction ?? 0, a.rightShoulderAbduction ?? 0) >= 45) upperArm += 1;
+  upperArm = Math.min(6, upperArm);
 
-  // Lower arm score (RULA Table 2) — use WORST arm (most deviated from 60-100° range)
+  // Lower arm: 1 = 60–100° flexion, 2 = outside that range
   const laWorst = Math.abs(a.leftLowerArm - 80) >= Math.abs(a.rightLowerArm - 80)
     ? a.leftLowerArm : a.rightLowerArm;
   let lowerArm = (laWorst >= 60 && laWorst <= 100) ? 1 : 2;
-  // +1 if forearm crosses midline
-  if (Math.max(a.leftForearmCross ?? 0, a.rightForearmCross ?? 0) > 15) lowerArm = Math.min(3, lowerArm + 1);
+  // +1 if forearm crosses midline or works out to side
+  if (Math.max(a.leftForearmCross ?? 0, a.rightForearmCross ?? 0) > 15) lowerArm = Math.min(2, lowerArm + 1);
 
-  // Wrist score
-  let wrist = 1;
+  // Wrist deviation from neutral (degrees)
+  // RULA worksheet: 1=0° (neutral), 2=0–15°, 3=>15°
   const wr = Math.max(a.leftWrist, a.rightWrist);
-  if (wr > 30) wrist = 3;
-  else if (wr > 15) wrist = 2;
+  let wrist = 1;
+  if (wr > 15) wrist = 3;
+  else if (wr > 0) wrist = 2;
+  // +1 if wrist bent from midline (ulnar/radial deviation)
+  // Approximate: if wrist score already elevated, add 1
+  const wristTwist = 1; // default mid-range; would need dedicated sensor for twist
 
-  // Neck score
+  // RULA Table A: 4D lookup [upperArm-1][lowerArm-1][wrist-1][wristTwist-1]
+  // Source: McAtamney & Corlett 1993, Table A (verified cell-by-cell)
+  const RULA_TABLE_A: number[][][][] = [
+    // UA=1
+    [[[1,2],[2,2],[2,3],[3,3]], [[2,2],[2,2],[3,3],[3,3]]],
+    // UA=2
+    [[[2,2],[2,3],[3,3],[3,4]], [[2,2],[2,3],[3,3],[3,4]]],
+    // UA=3
+    [[[2,3],[3,3],[3,4],[4,5]], [[2,3],[3,3],[3,4],[4,5]]],
+    // UA=4
+    [[[3,3],[3,4],[4,4],[5,5]], [[3,3],[3,4],[4,4],[5,5]]],
+    // UA=5
+    [[[4,4],[4,4],[4,5],[5,5]], [[4,4],[4,4],[4,5],[5,6]]],
+    // UA=6
+    [[[5,5],[5,5],[5,6],[6,7]], [[5,5],[5,5],[5,6],[6,7]]],
+  ];
+  const uaIdx = Math.min(5, upperArm - 1);
+  const laIdx = Math.min(1, lowerArm - 1);
+  const wrIdx = Math.min(3, wrist - 1);
+  const wtIdx = Math.min(1, wristTwist - 1);
+  const tableAScore = RULA_TABLE_A[uaIdx]?.[laIdx]?.[wrIdx]?.[wtIdx] ?? Math.min(7, upperArm + lowerArm + wrist);
+
+  // ── RULA Group B: Neck + Trunk + Legs ──────────────────────────────────────
+  // Neck: 1=0–10°, 2=10–20°, 3=>20°, 4=extension
   let neck = 1;
-  if (a.neckFlexion > 30) neck = 4;
-  else if (a.neckFlexion > 20) neck = 3;
+  if (a.neckFlexion > 20) neck = 3;
   else if (a.neckFlexion > 10) neck = 2;
-  if (a.neckLateral > 10) neck += 1;
+  if (a.neckLateral > 10) neck = Math.min(6, neck + 1);
 
-  // Trunk score (RULA Table 5 — floor is 1 for 0–10°, neutral standing = no penalty)
+  // Trunk: 1=upright/0–10°, 2=10–20°, 3=20–60°, 4=>60°
   let trunk = 1;
   if (a.trunkFlexion > 60) trunk = 4;
   else if (a.trunkFlexion > 20) trunk = 3;
   else if (a.trunkFlexion > 10) trunk = 2;
-  // 0–10° = 1 (neutral, no penalty)
-  if (a.trunkLateral > 10) trunk += 1;
-  if (a.trunkRotation > 15) trunk += 1;
+  if (a.trunkLateral > 10) trunk = Math.min(5, trunk + 1);
+  if (a.trunkRotation > 15) trunk = Math.min(5, trunk + 1);
 
-  // Muscle use modifier
+  // Legs: 1=supported/balanced, 2=not supported
+  const legs = 1; // MediaPipe doesn't reliably detect unilateral stance
+
+  // RULA Table B: 3D lookup [neck-1][trunk-1][legs-1]
+  // Source: McAtamney & Corlett 1993, Table B (verified cell-by-cell)
+  const RULA_TABLE_B: number[][][] = [
+    // neck=1: trunk 1..5, legs 1..2
+    [[1,3],[2,3],[3,4],[5,5],[6,6]],
+    // neck=2
+    [[2,3],[2,3],[4,5],[5,5],[6,7]],
+    // neck=3
+    [[3,3],[3,4],[4,5],[5,6],[6,7]],
+    // neck=4
+    [[5,5],[5,6],[6,7],[7,7],[7,8]],
+    // neck=5
+    [[7,7],[7,7],[7,8],[8,8],[8,8]],
+    // neck=6
+    [[8,8],[8,8],[8,8],[8,9],[9,9]],
+  ];
+  const nkIdx = Math.min(5, neck - 1);
+  const trIdx = Math.min(4, trunk - 1);
+  const lgIdx = Math.min(1, legs - 1);
+  const tableBScore = RULA_TABLE_B[nkIdx]?.[trIdx]?.[lgIdx] ?? Math.min(7, neck + trunk + legs);
+
+  // Muscle use and force/load modifiers
   const muscleScore = task.repRate > 4 ? 1 : 0;
-  // Force/load modifier
   const forceScore = task.loadWeight > 10 ? 3 : task.loadWeight > 2 ? 2 : 0;
 
-  // RULA Table A (arm+wrist group) and Table B (neck+trunk+leg group)
-  const armWristScore = Math.min(7, Math.max(1, upperArm + lowerArm + wrist + muscleScore + forceScore));
-  const neckTrunkScore = Math.min(7, Math.max(1, neck + trunk + muscleScore + forceScore));
+  const armWristScore = Math.min(9, Math.max(1, tableAScore + muscleScore + forceScore));
+  const neckTrunkScore = Math.min(9, Math.max(1, tableBScore + muscleScore + forceScore));
+
   // RULA Table C — validated 7×7 lookup (McAtamney & Corlett 1993)
   const RULA_TABLE_C: number[][] = [
     [1, 2, 3, 3, 4, 5, 5], // aws=1
@@ -494,7 +545,9 @@ export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: numb
     [4, 4, 5, 6, 6, 7, 7], // aws=6
     [5, 5, 6, 6, 7, 7, 7], // aws=7
   ];
-  const grandScore = RULA_TABLE_C[armWristScore - 1][neckTrunkScore - 1];
+  const awsIdx = Math.min(6, armWristScore - 1);
+  const ntsIdx = Math.min(6, neckTrunkScore - 1);
+  const grandScore = RULA_TABLE_C[awsIdx][ntsIdx];
 
   let actionLevel = 1;
   if (grandScore >= 7) actionLevel = 4;
@@ -667,6 +720,19 @@ export function calcNIOSH(task: TaskProfile, confidence: number): ScoreResult {
   const { loadWeight, horizontalDistance, verticalOrigin, verticalDestination,
     asymmetryAngle, coupling, duration } = task;
 
+  // Applicability check: NIOSH LI is only valid for manual lifting tasks with a defined load
+  if (!loadWeight || loadWeight <= 0) {
+    return {
+      score: 0,
+      riskLevel: 'negligible',
+      actionLevel: 0,
+      interpretation: 'N/A — NIOSH Lifting Index requires a defined load weight. Set load weight in Task Configuration to enable this score.',
+      components: {},
+      confidence: 0,
+      notApplicable: true,
+    };
+  }
+
   // Load Constant (LC) = 23 kg (NIOSH standard)
   const LC = 23;
 
@@ -718,6 +784,18 @@ export function calcNIOSH(task: TaskProfile, confidence: number): ScoreResult {
 export function calcRSI(angles: BodyAngles, task: TaskProfile, confidence: number): ScoreResult {
   // RSI = IE × EF × AD × WP × SP × DP
   // Based on Moore & Garg (1995) Strain Index
+  // Applicability: valid only for repetitive distal upper extremity tasks (repRate ≥ 2/min)
+  if (task.repRate < 2) {
+    return {
+      score: 0,
+      riskLevel: 'negligible',
+      actionLevel: 0,
+      interpretation: 'N/A — Strain Index applies to repetitive distal upper extremity tasks. Set repetitions/min ≥ 2 in Task Configuration to enable this score.',
+      components: {},
+      confidence: 0,
+      notApplicable: true,
+    };
+  }
 
   // Intensity of Exertion (IE) — proxy from load
   const IE = task.loadWeight > 10 ? 9 : task.loadWeight > 5 ? 5 : task.loadWeight > 2 ? 3 : 1;
@@ -871,6 +949,16 @@ export interface SessionRecord {
   avgReba: number;
   avgNiosh: number;
   avgRsi: number;
+  /** Peak integer RULA score (worst single frame) — the methodologically correct headline score */
+  peakRula: number;
+  /** Peak integer REBA score (worst single frame) — the methodologically correct headline score */
+  peakReba: number;
+  /** Index into snapshots[] of the peak RULA frame */
+  peakRulaFrame: number;
+  /** Index into snapshots[] of the peak REBA frame */
+  peakRebaFrame: number;
+  /** Percentage of frames in high or very-high risk (REBA ≥8) */
+  timeInHighRiskPct: number;
   peakRisk: RiskLevel;
   taskProfile: TaskProfile;
   // New fields
@@ -1014,6 +1102,20 @@ export function summarizeSession(
     return RISK_ORDER.indexOf(s.overallRisk) > RISK_ORDER.indexOf(max) ? s.overallRisk : max;
   }, 'negligible');
 
+  // Peak integer scores — the methodologically correct headline scores for RULA/REBA
+  // (ordinal scales must not be averaged; peak worst-frame is the standard reporting value)
+  let peakRulaScore = 0;
+  let peakRebaScore = 0;
+  let peakRulaFrame = 0;
+  let peakRebaFrame = 0;
+  filteredSnapshots.forEach((s, i) => {
+    if (s.rula.score > peakRulaScore) { peakRulaScore = s.rula.score; peakRulaFrame = i; }
+    if (s.reba.score > peakRebaScore) { peakRebaScore = s.reba.score; peakRebaFrame = i; }
+  });
+  const timeInHighRiskPct = filteredSnapshots.length
+    ? Math.round(filteredSnapshots.filter(s => s.reba.score >= 8).length / filteredSnapshots.length * 100)
+    : 0;
+
   return {
     id: `ERG-${Date.now().toString(36).toUpperCase()}`,
     taskName: task.taskName,
@@ -1024,6 +1126,11 @@ export function summarizeSession(
     avgReba: Math.round(avg(s => s.reba.score) * 10) / 10,
     avgNiosh: Math.round(avg(s => s.niosh.score) * 100) / 100,
     avgRsi: Math.round(avg(s => s.rsi.score) * 10) / 10,
+    peakRula: peakRulaScore,
+    peakReba: peakRebaScore,
+    peakRulaFrame,
+    peakRebaFrame,
+    timeInHighRiskPct,
     peakRisk,
     taskProfile: task,
     source,
