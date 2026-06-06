@@ -27,8 +27,8 @@ const NEUTRAL_ANGLES: BodyAngles = {
   rightLowerArm: 90,
   leftWrist: 0,
   rightWrist: 0,
-  leftKnee: 175,
-  rightKnee: 175,
+  leftKnee: 150,
+  rightKnee: 150,
   hipFlexion: 5,
   leftShoulderAbduction: 0,
   rightShoulderAbduction: 0,
@@ -293,5 +293,192 @@ describe('Cross-method consistency', () => {
     const reba = calcREBA(NEUTRAL_ANGLES, TASK_NO_LOAD, 0.95);
     expect(rula.riskLevel).toMatch(/negligible|low/);
     expect(reba.riskLevel).toMatch(/negligible|low/);
+  });
+});
+
+// ─── Determinism (10-run) ─────────────────────────────────────────────────────
+/**
+ * DETERMINISM GUARANTEE (10-run assertion)
+ *
+ * All scoring functions must be pure: identical inputs must always produce
+ * identical outputs regardless of call order, timing, or prior state.
+ *
+ * This suite runs each scoring function 10 times with the same inputs and
+ * asserts that every run produces the same score. This guards against:
+ *   - Accidental global state mutation (e.g. _lastValidAngles leaking into scores)
+ *   - Floating-point non-determinism from order-dependent operations
+ *   - Rounding inconsistencies introduced by future refactors
+ *
+ * Note: extractAngles uses _lastValidAngles hold-last-valid state, which is
+ * intentionally stateful. The scoring functions (calcRULA, calcREBA, calcNIOSH,
+ * calcRSI) are pure and must not depend on that state.
+ */
+describe('Determinism (10-run)', () => {
+  it('calcRULA: 10 identical calls produce identical scores (neutral posture)', () => {
+    const scores = Array.from({ length: 10 }, () =>
+      calcRULA(NEUTRAL_ANGLES, TASK_NO_LOAD, 0.9).score
+    );
+    const first = scores[0];
+    scores.forEach((s, i) => expect(s).toBe(first));
+  });
+
+  it('calcRULA: 10 identical calls produce identical scores (high-risk posture)', () => {
+    const scores = Array.from({ length: 10 }, () =>
+      calcRULA(HIGH_RISK_ANGLES, TASK_HEAVY_LIFT, 0.8).score
+    );
+    const first = scores[0];
+    scores.forEach((s, i) => expect(s).toBe(first));
+  });
+
+  it('calcRULA: 10 identical calls produce identical scores (seated keyboard)', () => {
+    const scores = Array.from({ length: 10 }, () =>
+      calcRULA(SEATED_KEYBOARD, TASK_LIGHT, 0.9).score
+    );
+    const first = scores[0];
+    scores.forEach((s, i) => expect(s).toBe(first));
+  });
+
+  it('calcREBA: 10 identical calls produce identical scores (neutral posture)', () => {
+    const scores = Array.from({ length: 10 }, () =>
+      calcREBA(NEUTRAL_ANGLES, TASK_NO_LOAD, 0.9).score
+    );
+    const first = scores[0];
+    scores.forEach((s, i) => expect(s).toBe(first));
+  });
+
+  it('calcREBA: 10 identical calls produce identical scores (high-risk posture)', () => {
+    const scores = Array.from({ length: 10 }, () =>
+      calcREBA(HIGH_RISK_ANGLES, TASK_HEAVY_LIFT, 0.8).score
+    );
+    const first = scores[0];
+    scores.forEach((s, i) => expect(s).toBe(first));
+  });
+
+  it('calcREBA: 10 identical calls produce identical scores (seated keyboard)', () => {
+    const scores = Array.from({ length: 10 }, () =>
+      calcREBA(SEATED_KEYBOARD, TASK_LIGHT, 0.9).score
+    );
+    const first = scores[0];
+    scores.forEach((s, i) => expect(s).toBe(first));
+  });
+
+  it('calcNIOSH: 10 identical calls produce identical scores', () => {
+    const scores = Array.from({ length: 10 }, () =>
+      calcNIOSH(TASK_HEAVY_LIFT, 0.9).score
+    );
+    const first = scores[0];
+    scores.forEach((s, i) => expect(s).toBe(first));
+  });
+
+  it('calcRSI: 10 identical calls produce identical scores (high-risk posture)', () => {
+    const task: TaskProfile = { ...DEFAULT_TASK_PROFILE, repRate: 12, loadWeight: 5, duration: 'moderate' };
+    const scores = Array.from({ length: 10 }, () =>
+      calcRSI(HIGH_RISK_ANGLES, task, 0.85).score
+    );
+    const first = scores[0];
+    scores.forEach((s, i) => expect(s).toBe(first));
+  });
+
+  it('calcRULA: interleaved calls with different inputs do not cross-contaminate', () => {
+    // Run neutral and high-risk alternately 5 times each; scores must not drift
+    const neutralScores: number[] = [];
+    const highRiskScores: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      neutralScores.push(calcRULA(NEUTRAL_ANGLES, TASK_NO_LOAD, 0.9).score);
+      highRiskScores.push(calcRULA(HIGH_RISK_ANGLES, TASK_LIGHT, 0.85).score);
+    }
+    const firstNeutral = neutralScores[0];
+    const firstHighRisk = highRiskScores[0];
+    neutralScores.forEach(s => expect(s).toBe(firstNeutral));
+    highRiskScores.forEach(s => expect(s).toBe(firstHighRisk));
+  });
+
+  it('calcREBA: interleaved calls with different inputs do not cross-contaminate', () => {
+    const neutralScores: number[] = [];
+    const highRiskScores: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      neutralScores.push(calcREBA(NEUTRAL_ANGLES, TASK_NO_LOAD, 0.9).score);
+      highRiskScores.push(calcREBA(HIGH_RISK_ANGLES, TASK_HEAVY_LIFT, 0.8).score);
+    }
+    const firstNeutral = neutralScores[0];
+    const firstHighRisk = highRiskScores[0];
+    neutralScores.forEach(s => expect(s).toBe(firstNeutral));
+    highRiskScores.forEach(s => expect(s).toBe(firstHighRisk));
+  });
+});
+
+// ─── Anatomical Plausibility Guard (ITEM 4) ───────────────────────────────────
+import { validateAngles, ANATOMICAL_LIMITS } from '../ergo-engine';
+
+describe('Anatomical Plausibility Guard (validateAngles)', () => {
+  it('PASS-THROUGH: valid angles are returned unchanged', () => {
+    const result = validateAngles(NEUTRAL_ANGLES);
+    expect(result.lowConfidence).toBe(false);
+    expect(result.implausibleJoints).toHaveLength(0);
+    expect(result.angles.neckFlexion).toBe(NEUTRAL_ANGLES.neckFlexion);
+    expect(result.angles.trunkFlexion).toBe(NEUTRAL_ANGLES.trunkFlexion);
+  });
+
+  it('CLAMP: neck flexion above 80° is clamped to 80°', () => {
+    const implausible = { ...NEUTRAL_ANGLES, neckFlexion: 120 };
+    const result = validateAngles(implausible);
+    expect(result.angles.neckFlexion).toBe(80);
+    expect(result.implausibleJoints).toContain('neckFlexion');
+    expect(result.lowConfidence).toBe(true);
+  });
+
+  it('CLAMP: wrist deviation above 90° is clamped to 90°', () => {
+    const implausible = { ...NEUTRAL_ANGLES, leftWrist: 150, rightWrist: 200 };
+    const result = validateAngles(implausible);
+    expect(result.angles.leftWrist).toBe(90);
+    expect(result.angles.rightWrist).toBe(90);
+    expect(result.implausibleJoints).toContain('leftWrist');
+    expect(result.implausibleJoints).toContain('rightWrist');
+  });
+
+  it('CLAMP: negative angles are clamped to 0 (all joints have min=0)', () => {
+    const implausible = { ...NEUTRAL_ANGLES, trunkFlexion: -15, neckFlexion: -5 };
+    const result = validateAngles(implausible);
+    expect(result.angles.trunkFlexion).toBe(0);
+    expect(result.angles.neckFlexion).toBe(0);
+    expect(result.implausibleJoints).toContain('trunkFlexion');
+    expect(result.implausibleJoints).toContain('neckFlexion');
+  });
+
+  it('CLAMP: multiple implausible joints are all clamped and listed', () => {
+    const implausible = {
+      ...NEUTRAL_ANGLES,
+      neckFlexion: 200,
+      trunkFlexion: 180,
+      leftUpperArm: 250,
+    };
+    const result = validateAngles(implausible);
+    expect(result.angles.neckFlexion).toBe(ANATOMICAL_LIMITS.neckFlexion.max);
+    expect(result.angles.trunkFlexion).toBe(ANATOMICAL_LIMITS.trunkFlexion.max);
+    expect(result.angles.leftUpperArm).toBe(ANATOMICAL_LIMITS.leftUpperArm.max);
+    expect(result.implausibleJoints.length).toBeGreaterThanOrEqual(3);
+    expect(result.lowConfidence).toBe(true);
+  });
+
+  it('LIMITS: all ANATOMICAL_LIMITS entries have min < max', () => {
+    for (const [joint, { min, max }] of Object.entries(ANATOMICAL_LIMITS)) {
+      expect(min).toBeLessThan(max);
+    }
+  });
+
+  it('LIMITS: RULA/REBA safe ranges fall within anatomical limits', () => {
+    // Upper arm: RULA penalises >90°; anatomical max is 180°. Safe range is subset.
+    expect(ANATOMICAL_LIMITS.leftUpperArm.max).toBeGreaterThanOrEqual(90);
+    // Neck: REBA penalises >20°; anatomical max is 80°. Safe range is subset.
+    expect(ANATOMICAL_LIMITS.neckFlexion.max).toBeGreaterThanOrEqual(20);
+    // Wrist: RULA penalises >15°; anatomical max is 90°. Safe range is subset.
+    expect(ANATOMICAL_LIMITS.leftWrist.max).toBeGreaterThanOrEqual(15);
+  });
+
+  it('SCORING IMPACT: clamped implausible neck flexion does not inflate RULA above 7', () => {
+    const implausible = { ...NEUTRAL_ANGLES, neckFlexion: 999 };
+    const { angles } = validateAngles(implausible);
+    const result = calcRULA(angles, TASK_NO_LOAD, 0.9);
+    expect(result.score).toBeLessThanOrEqual(7);
   });
 });

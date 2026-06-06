@@ -148,6 +148,10 @@ function RiskBadge({ level }: { level: RiskLevel }) {
 }
 
 // ─── Score card with expandable explainer ────────────────────────────────────
+// FIX 2: When notApplicable=true, render a neutral grey "N/A" badge instead of
+// a colored risk level badge. Risk-level coloring may only appear when the method
+// actually produced a score. A green "Negligible" badge on an N/A method creates
+// a false-safety signal (reader concludes "no risk" when the truth is "not assessed").
 function ScoreCard({ type, score, riskLevel, isPeak, notApplicable }: {
   type: keyof typeof SCORE_EXPLAINERS;
   score: number;
@@ -158,8 +162,8 @@ function ScoreCard({ type, score, riskLevel, isPeak, notApplicable }: {
   const [expanded, setExpanded] = useState(false);
   const exp = SCORE_EXPLAINERS[type];
   const action = exp.actionLevel(score);
-  const barColor = riskColor(riskLevel);
-  const pct = Math.min(100, (score / exp.maxScore) * 100);
+  const barColor = notApplicable ? '#94a3b8' : riskColor(riskLevel); // grey bar when N/A
+  const pct = notApplicable ? 0 : Math.min(100, (score / exp.maxScore) * 100);
 
   return (
     <Card className="overflow-hidden">
@@ -186,7 +190,14 @@ function ScoreCard({ type, score, riskLevel, isPeak, notApplicable }: {
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">{exp.fullName}</p>
             </div>
-            <RiskBadge level={riskLevel} />
+            {/* FIX 2: N/A methods get a neutral grey badge, never a colored risk badge */}
+            {notApplicable ? (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-semibold border bg-slate-100 text-slate-500 border-slate-300">
+                — N/A
+              </span>
+            ) : (
+              <RiskBadge level={riskLevel} />
+            )}
           </div>
           {notApplicable ? (
             <div className="flex items-center gap-2 mb-3 py-2 px-3 bg-slate-50 rounded-lg border border-slate-200">
@@ -776,7 +787,115 @@ function ActionRow({ action, onStatusChange }: { action: CorrectiveAction; onSta
   );
 }
 
-// ─── Main page ────────────────────────────────────────────────────────────────
+// ─── Angle row helper ────────────────────────────────────────────────────────────────────────────────
+function AngleRow({ angleKey, value, lowConf }: { angleKey: string; value: number; lowConf?: boolean }) {
+  const info = ANGLE_SAFE_RANGES[angleKey];
+  if (!info) return null;
+  const risk = lowConf ? 'safe' : getAngleRisk(angleKey, value);
+  const color = lowConf ? '#94a3b8' : angleColor(risk);
+  const [lo, hi] = info.safe;
+  const maxRange = Math.max(Math.abs(lo), Math.abs(hi)) * 2.5;
+  const pct = Math.min(100, (Math.abs(value) / maxRange) * 100);
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between text-xs">
+        <span className="font-medium">{info.label}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-muted-foreground text-[10px]">Safe: {lo}° to {hi}°</span>
+          <span className="font-bold" style={{ color }}>{value.toFixed(1)}°</span>
+          {lowConf ? (
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-300">
+              ⚠ Low confidence
+            </span>
+          ) : risk !== 'safe' ? (
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ backgroundColor: color + '20', color }}>
+              {risk === 'danger' ? '⚠ Outside safe range' : '~ Near limit'}
+            </span>
+          ) : null}
+        </div>
+      </div>
+      <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: color }} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * FIX 3: AngleSection renders two sub-sections:
+ *   1. Peak-Posture Frame Angles (primary, authoritative) — from session.peakAngles
+ *      These are the angles at the worst-posture frame that produced the peak score.
+ *      Recommendations and corrective actions are derived from this frame.
+ *   2. Clip Average Angles (secondary, non-authoritative, collapsible) — from session.avgAngles
+ *      Provided for context only. Labeled explicitly as non-authoritative.
+ */
+function AngleSection({ session }: { session: SessionRecord }) {
+  const [avgExpanded, setAvgExpanded] = useState(false);
+  const hasPeak = session.peakAngles && Object.keys(session.peakAngles).length > 0;
+  const hasAvg  = session.avgAngles  && Object.keys(session.avgAngles).length  > 0;
+  if (!hasPeak && !hasAvg) return null;
+
+  const frameLabel = session.peakAnglesFrame !== undefined
+    ? `Frame #${session.peakAnglesFrame + 1} (peak RULA posture)`
+    : 'peak RULA posture frame';
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm flex items-center gap-2">
+          <Activity className="w-4 h-4 text-sky-500" />
+          Peak-Posture Frame Angles
+        </CardTitle>
+        <p className="text-xs text-muted-foreground">
+          Joint angles at the {frameLabel} — the evidence that justifies the headline score.
+          Red values are outside the published safe range.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {hasPeak && (
+          <div className="space-y-3">
+            {Object.entries(session.peakAngles!).map(([key, value]) => (
+              <AngleRow key={key} angleKey={key} value={value} />
+            ))}
+          </div>
+        )}
+
+        {/* Clip-average angles — collapsible, explicitly non-authoritative */}
+        {hasAvg && (
+          <div className="border-t pt-3">
+            <button
+              className="w-full flex items-center justify-between text-xs text-muted-foreground hover:text-foreground transition-colors py-1"
+              onClick={() => setAvgExpanded(v => !v)}
+            >
+              <span className="flex items-center gap-1.5">
+                <ChevronDown className={`w-3.5 h-3.5 transition-transform ${avgExpanded ? 'rotate-180' : ''}`} />
+                Clip Average Angles
+                <span className="ml-1 text-[10px] px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded-full border border-slate-200">
+                  non-authoritative
+                </span>
+              </span>
+              <span className="text-[10px] text-muted-foreground/70">
+                Average across all {session.snapshots.length} frames — does not represent any single posture
+              </span>
+            </button>
+            {avgExpanded && (
+              <div className="mt-3 space-y-3 pl-1 border-l-2 border-slate-200">
+                <p className="text-[11px] text-muted-foreground italic ml-2">
+                  These are clip-wide averages. They do not correspond to the peak score and should not be used to justify the headline assessment.
+                </p>
+                {Object.entries(session.avgAngles!).map(([key, value]) => (
+                  <AngleRow key={key} angleKey={key} value={value} />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── Main page ────────────────────────────────────────────────────────────────────────────────
 export default function SessionReport() {
   const { id } = useParams<{ id: string }>();
   const [, navigate] = useLocation();
@@ -970,47 +1089,8 @@ export default function SessionReport() {
         </Card>
       )}
 
-      {/* Average Joint Angles */}
-      {session.avgAngles && Object.keys(session.avgAngles).length > 0 && (
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-sm flex items-center gap-2"><Activity className="w-4 h-4 text-sky-500" />Average Joint Angles</CardTitle>
-            <p className="text-xs text-muted-foreground">How far each joint moved from its neutral (safe) position on average. Red values are outside the safe range.</p>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-3">
-              {Object.entries(session.avgAngles).map(([key, value]) => {
-                const info = ANGLE_SAFE_RANGES[key];
-                if (!info) return null;
-                const risk = getAngleRisk(key, value);
-                const color = angleColor(risk);
-                const [lo, hi] = info.safe;
-                const maxRange = Math.max(Math.abs(lo), Math.abs(hi)) * 2.5;
-                const pct = Math.min(100, (Math.abs(value) / maxRange) * 100);
-                return (
-                  <div key={key} className="space-y-1">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-medium">{info.label}</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-muted-foreground text-[10px]">Safe: {lo}° to {hi}°</span>
-                        <span className="font-bold" style={{ color }}>{value.toFixed(1)}°</span>
-                        {risk !== 'safe' && (
-                          <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ backgroundColor: color + '20', color }}>
-                            {risk === 'danger' ? '⚠ Outside safe range' : '~ Near limit'}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
-                      <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: color }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </CardContent>
-        </Card>
-      )}
+      {/* FIX 3: Joint Angles — Peak-Posture Frame (primary, authoritative) + Clip Average (secondary, non-authoritative) */}
+      <AngleSection session={session} />
 
       {/* Risk Score Timeline */}
       {chartData.length > 1 && (

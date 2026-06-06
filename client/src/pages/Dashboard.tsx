@@ -1,6 +1,16 @@
 /**
  * Dashboard — ErgoKit CV Platform
  * Home page: KPI summary, recent sessions, quick-start CTA.
+ *
+ * FIX 1 (2026-06-06): All RULA/REBA aggregates now use per-session PEAK integer
+ * scores (session.peakRula / session.peakReba), not per-frame averages.
+ * - Single session → shows the integer directly (no decimal).
+ * - Multi-session → shows the average of session peaks, explicitly labeled.
+ * - Session Score Trend chart plots peakRula/peakReba (normalized) per session.
+ * Rationale: RULA (1–7) and REBA (1–15) are ordinal scales; averaging per-frame
+ * scores introduces false precision. The methodologically correct headline value
+ * is the peak worst-frame integer, per McAtamney & Corlett 1993 and Hignett &
+ * McAtamney 2000.
  */
 import { Link } from 'wouter';
 import { Camera, ClipboardList, Activity, AlertTriangle, ChevronRight, Zap, Upload, Wrench, FileVideo } from 'lucide-react';
@@ -25,19 +35,34 @@ export default function Dashboard() {
 
   const totalSessions = sessions.length;
   const highRiskSessions = sessions.filter(s => s.peakRisk === 'high' || s.peakRisk === 'very-high').length;
-  const avgRula = totalSessions
-    ? Math.round((sessions.reduce((s, x) => s + x.avgRula, 0) / totalSessions) * 10) / 10
-    : 0;
-  const avgReba = totalSessions
-    ? Math.round((sessions.reduce((s, x) => s + x.avgReba, 0) / totalSessions) * 10) / 10
-    : 0;
+
+  // FIX 1: Use per-session PEAK integer scores (not per-frame averages).
+  // For a single session, this returns the integer directly.
+  // For multiple sessions, this is the average of session peaks (labeled explicitly in UI).
+  const peakRulaValues = sessions.map(s => s.peakRula ?? Math.round(s.avgRula));
+  const peakRebaValues = sessions.map(s => s.peakReba ?? Math.round(s.avgReba));
+
+  // Display value: integer for single session, rounded-to-1dp average for multi-session
+  const displayRula = totalSessions === 0 ? 0
+    : totalSessions === 1 ? peakRulaValues[0]
+    : Math.round((peakRulaValues.reduce((a, b) => a + b, 0) / totalSessions) * 10) / 10;
+  const displayReba = totalSessions === 0 ? 0
+    : totalSessions === 1 ? peakRebaValues[0]
+    : Math.round((peakRebaValues.reduce((a, b) => a + b, 0) / totalSessions) * 10) / 10;
+
+  // Label changes for multi-session to make clear these are averages of peaks
+  const rulaLabel = totalSessions <= 1 ? 'PEAK RULA' : 'Avg Peak RULA';
+  const rebaLabel = totalSessions <= 1 ? 'PEAK REBA' : 'Avg Peak REBA';
+
   const openActions = sessions.reduce((sum, s) => sum + (s.actions ?? []).filter(a => a.status === 'open' || a.status === 'in-progress').length, 0);
   const videoSessions = sessions.filter(s => s.source === 'video-upload').length;
 
+  // FIX 1: Chart plots peakRula and normalized peakReba per session (not averages)
   const chartData = sessions.slice(0, 7).reverse().map((s, i) => ({
     name: `S${i + 1}`,
-    rula: s.avgRula,
-    reba: Math.round(s.avgReba / 15 * 7 * 10) / 10,
+    rula: s.peakRula ?? Math.round(s.avgRula),
+    // Normalize REBA to RULA scale (÷15×7) for same-axis comparison
+    reba: Math.round(((s.peakReba ?? Math.round(s.avgReba)) / 15 * 7) * 10) / 10,
     risk: s.peakRisk,
   }));
 
@@ -73,15 +98,32 @@ export default function Dashboard() {
         <KpiCard label="Video Uploads" value={videoSessions} icon={<FileVideo className="w-4 h-4" />} color="blue" />
         <KpiCard label="High Risk" value={highRiskSessions} icon={<AlertTriangle className="w-4 h-4" />} color={highRiskSessions > 0 ? 'red' : 'green'} />
         <KpiCard label="Open Actions" value={openActions} icon={<Wrench className="w-4 h-4" />} color={openActions > 0 ? 'amber' : 'green'} />
-        <KpiCard label="Avg RULA" value={avgRula} icon={<Activity className="w-4 h-4" />} color={avgRula >= 5 ? 'red' : avgRula >= 3 ? 'amber' : 'green'} suffix="/7" />
-        <KpiCard label="Avg REBA" value={avgReba} icon={<Zap className="w-4 h-4" />} color={avgReba >= 8 ? 'red' : avgReba >= 4 ? 'amber' : 'green'} suffix="/15" />
+        <KpiCard
+          label={rulaLabel}
+          value={displayRula}
+          icon={<Activity className="w-4 h-4" />}
+          color={displayRula >= 5 ? 'red' : displayRula >= 3 ? 'amber' : 'green'}
+          suffix="/7"
+          isInteger={totalSessions <= 1}
+        />
+        <KpiCard
+          label={rebaLabel}
+          value={displayReba}
+          icon={<Zap className="w-4 h-4" />}
+          color={displayReba >= 8 ? 'red' : displayReba >= 4 ? 'amber' : 'green'}
+          suffix="/15"
+          isInteger={totalSessions <= 1}
+        />
       </div>
 
       <div className="grid lg:grid-cols-5 gap-5">
         <Card className="lg:col-span-3 shadow-sm border-border">
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-semibold" style={{ fontFamily: "\'DM Sans\', sans-serif" }}>Session Score Trend</CardTitle>
-            <p className="text-xs text-muted-foreground">RULA and normalized REBA across last 7 sessions</p>
+            {/* FIX 1: Subtitle now accurately describes what is plotted */}
+            <p className="text-xs text-muted-foreground">
+              Peak RULA and normalized peak REBA across last 7 sessions
+            </p>
           </CardHeader>
           <CardContent>
             {chartData.length > 0 ? (
@@ -90,13 +132,20 @@ export default function Dashboard() {
                   <CartesianGrid strokeDasharray="3 3" stroke="oklch(0.92 0.004 240)" />
                   <XAxis dataKey="name" tick={{ fontSize: 11, fill: 'oklch(0.52 0.02 240)' }} />
                   <YAxis domain={[0, 7]} tick={{ fontSize: 11, fill: 'oklch(0.52 0.02 240)' }} />
-                  <Tooltip contentStyle={{ fontSize: 12, borderRadius: 6 }} formatter={(v: number) => [v.toFixed(1)]} />
-                  <Bar dataKey="rula" name="RULA" radius={[3, 3, 0, 0]}>
+                  <Tooltip
+                    contentStyle={{ fontSize: 12, borderRadius: 6 }}
+                    formatter={(v: number, name: string) => {
+                      // Show integer for RULA (it's already a peak integer); show 1dp for normalized REBA
+                      if (name === 'Peak RULA') return [Math.round(v).toString(), name];
+                      return [v.toFixed(1), name];
+                    }}
+                  />
+                  <Bar dataKey="rula" name="Peak RULA" radius={[3, 3, 0, 0]}>
                     {chartData.map((entry, i) => (
                       <Cell key={i} fill={riskColor(entry.risk as any)} />
                     ))}
                   </Bar>
-                  <Bar dataKey="reba" name="REBA (norm)" fill="oklch(0.62 0.18 220)" radius={[3, 3, 0, 0]} opacity={0.6} />
+                  <Bar dataKey="reba" name="Peak REBA (norm)" fill="oklch(0.62 0.18 220)" radius={[3, 3, 0, 0]} opacity={0.6} />
                 </BarChart>
               </ResponsiveContainer>
             ) : (
@@ -177,11 +226,14 @@ export default function Dashboard() {
   );
 }
 
-function KpiCard({ label, value, icon, color, suffix }: {
+function KpiCard({ label, value, icon, color, suffix, isInteger }: {
   label: string; value: number; icon: React.ReactNode;
   color: 'blue' | 'red' | 'amber' | 'green'; suffix?: string;
+  /** When true, display as integer (no decimal). Used for single-session peak scores. */
+  isInteger?: boolean;
 }) {
   const colorMap = { blue: 'bg-blue-50 text-blue-600', red: 'bg-red-50 text-red-600', amber: 'bg-amber-50 text-amber-600', green: 'bg-green-50 text-green-600' };
+  const displayValue = isInteger ? Math.round(value).toString() : value.toString();
   return (
     <Card className="shadow-sm border-border">
       <CardContent className="p-4">
@@ -190,7 +242,7 @@ function KpiCard({ label, value, icon, color, suffix }: {
           <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${colorMap[color]}`}>{icon}</div>
         </div>
         <div className="flex items-baseline gap-1">
-          <span className="text-2xl font-bold text-foreground" style={{ fontFamily: "\'DM Sans\', sans-serif" }}>{value}</span>
+          <span className="text-2xl font-bold text-foreground" style={{ fontFamily: "\'DM Sans\', sans-serif" }}>{displayValue}</span>
           {suffix && <span className="text-sm text-muted-foreground">{suffix}</span>}
         </div>
       </CardContent>

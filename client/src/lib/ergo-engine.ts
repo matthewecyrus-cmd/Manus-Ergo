@@ -128,8 +128,92 @@ export const DEFAULT_TASK_PROFILE: TaskProfile = {
   dominantSide: 'right',
 };
 
-// ─── CONFIDENCE THRESHOLD ────────────────────────────────────────────────────
+// ─── CONFIDENCE THRESHOLD ────────────────────────────────────────────
 export const VISIBILITY_THRESHOLD = 0.65;
+
+// ─── ANATOMICAL PLAUSIBILITY GUARD (ITEM 4) ───────────────────────────────────
+/**
+ * Per-joint absolute range limits (degrees).
+ * Values outside these bounds are anatomically impossible for a healthy adult
+ * and indicate a tracking artifact (landmark flip, occlusion, or model error).
+ *
+ * Sources:
+ *   - Neck flexion/extension: Kapandji 2008 (0–80° flex, 0–50° ext)
+ *   - Trunk flexion: White & Panjabi 1990 (0–90°)
+ *   - Upper arm elevation: shoulder ROM 0–180° (abduction/flexion)
+ *   - Lower arm (elbow): 0–150° flexion (0° = full extension)
+ *   - Wrist deviation: 0–90° (combined flex/ext/radial/ulnar)
+ *   - Knee: 0–150° flexion (0° = full extension)
+ *   - Hip flexion: 0–120° (standing to seated)
+ *
+ * Any angle outside [0, maxPlausible] is clamped to the boundary AND flagged
+ * as low-confidence so downstream scoring can apply a conservative fallback.
+ */
+export const ANATOMICAL_LIMITS: Record<keyof BodyAngles, { min: number; max: number }> = {
+  neckFlexion:           { min: 0,   max: 80  },
+  neckLateral:           { min: 0,   max: 45  },
+  trunkFlexion:          { min: 0,   max: 90  },
+  trunkLateral:          { min: 0,   max: 45  },
+  trunkRotation:         { min: 0,   max: 45  },
+  leftUpperArm:          { min: 0,   max: 180 },
+  rightUpperArm:         { min: 0,   max: 180 },
+  leftLowerArm:          { min: 0,   max: 150 },
+  rightLowerArm:         { min: 0,   max: 150 },
+  leftWrist:             { min: 0,   max: 90  },
+  rightWrist:            { min: 0,   max: 90  },
+  leftKnee:              { min: 0,   max: 150 },
+  rightKnee:             { min: 0,   max: 150 },
+  hipFlexion:            { min: 0,   max: 120 },
+  leftShoulderAbduction: { min: 0,   max: 180 },
+  rightShoulderAbduction:{ min: 0,   max: 180 },
+  leftForearmCross:      { min: 0,   max: 90  },
+  rightForearmCross:     { min: 0,   max: 90  },
+};
+
+/**
+ * Validate and clamp a BodyAngles object against anatomical limits.
+ * Returns:
+ *   - angles: clamped copy (values within plausible range)
+ *   - implausibleJoints: list of joint names that were outside limits
+ *   - lowConfidence: true if any joint was implausible (caller should flag the frame)
+ *
+ * Clamping strategy: we clamp to the boundary rather than discarding the frame
+ * entirely, because a partially-visible frame still contains useful information
+ * for other joints. The implausibleJoints list lets scoring functions apply
+ * conservative fallbacks for only the affected joints.
+ */
+export function validateAngles(raw: BodyAngles): {
+  angles: BodyAngles;
+  implausibleJoints: string[];
+  lowConfidence: boolean;
+} {
+  const angles = { ...raw };
+  const implausibleJoints: string[] = [];
+
+  for (const key of Object.keys(ANATOMICAL_LIMITS) as (keyof BodyAngles)[]) {
+    const { min, max } = ANATOMICAL_LIMITS[key];
+    const v = angles[key];
+    if (v < min || v > max) {
+      implausibleJoints.push(key);
+      // Clamp to nearest boundary
+      (angles as Record<string, number>)[key] = Math.max(min, Math.min(max, v));
+    }
+  }
+
+  return {
+    angles,
+    implausibleJoints,
+    lowConfidence: implausibleJoints.length > 0,
+  };
+}
+
+/**
+ * Confidence threshold below which a frame is considered low-confidence
+ * for scoring purposes. Frames with avgConfidence < this value are still
+ * processed but their scores are down-weighted in the outlier filter.
+ * (Separate from VISIBILITY_THRESHOLD which gates individual joints.)
+ */
+export const LOW_CONFIDENCE_FRAME_THRESHOLD = 0.55;
 
 // ─── EMA FILTER ──────────────────────────────────────────────────────────────
 /**
@@ -860,18 +944,36 @@ export function aggregateRisk(scores: ScoreResult[]): { overallRisk: RiskLevel; 
   return { overallRisk: maxRisk, overallScore };
 }
 
-// ─── FULL SNAPSHOT CALCULATOR ────────────────────────────────────────────────
+/// ─── FULL SNAPSHOT CALCULATOR ────────────────────────────────────────────
 export function computeSnapshot(
   smoothedLandmarks: Landmarks,
   task: TaskProfile,
 ): ErgoSnapshot | null {
-  const { angles, avgConfidence } = extractAngles(smoothedLandmarks);
+  const { angles: rawAngles, avgConfidence } = extractAngles(smoothedLandmarks);
   if (avgConfidence < 0.3) return null; // not enough body visible
 
-  const rula = calcRULA(angles, task, avgConfidence);
-  const reba = calcREBA(angles, task, avgConfidence);
-  const niosh = calcNIOSH(task, avgConfidence);
-  const rsi = calcRSI(angles, task, avgConfidence);
+  // ITEM 4: Anatomical plausibility guard.
+  // Clamp any joint angle that falls outside its published physiological range.
+  // This prevents tracking artifacts (landmark flips, occlusion glitches) from
+  // inflating RULA/REBA scores. Implausible joints are logged; if any are found
+  // the frame is treated as low-confidence (confidence capped at 0.5) so the
+  // outlier filter in summarizeSession is more likely to exclude it.
+  const { angles, implausibleJoints, lowConfidence } = validateAngles(rawAngles);
+  const effectiveConfidence = lowConfidence
+    ? Math.min(avgConfidence, LOW_CONFIDENCE_FRAME_THRESHOLD)
+    : avgConfidence;
+
+  if (implausibleJoints.length > 0 && process.env.NODE_ENV !== 'production') {
+    // Development-only diagnostic: log which joints were clamped
+    console.debug(
+      `[ErgoKit] Plausibility guard clamped ${implausibleJoints.length} joint(s): ${implausibleJoints.join(', ')}`,
+    );
+  }
+
+  const rula = calcRULA(angles, task, effectiveConfidence);
+  const reba = calcREBA(angles, task, effectiveConfidence);
+  const niosh = calcNIOSH(task, effectiveConfidence);
+  const rsi = calcRSI(angles, task, effectiveConfidence);
   const { overallRisk, overallScore } = aggregateRisk([rula, reba, niosh, rsi]);
 
   return {
@@ -881,7 +983,7 @@ export function computeSnapshot(
   };
 }
 
-// ─── RISK COLOR HELPERS ───────────────────────────────────────────────────────
+// ─── RISK COLOR HELPERS───────────────────────────────────────────────────────
 export function riskColor(level: RiskLevel): string {
   const map: Record<RiskLevel, string> = {
     negligible: '#16A34A',
@@ -978,6 +1080,15 @@ export interface SessionRecord {
   videoUrl?: string;
   /** Average joint angles across all snapshots */
   avgAngles?: Record<string, number>;
+  /**
+   * FIX 3: Joint angles from the peak-posture frame (the frame that produced the
+   * peak RULA score). These are the authoritative angles that justify the headline
+   * score. Recommendations and corrective actions are derived from this frame.
+   * Source: snapshots[peakRulaFrame].angles
+   */
+  peakAngles?: Record<string, number>;
+  /** Frame index (within snapshots[]) that peakAngles was taken from */
+  peakAnglesFrame?: number;
 }
 
 // ─── BODY REGION RISK BUILDER ────────────────────────────────────────────────
@@ -1018,59 +1129,80 @@ export function buildBodyRegions(snapshots: ErgoSnapshot[]): BodyRegionRisk[] {
 }
 
 // ─── AI RECOMMENDATIONS GENERATOR ────────────────────────────────────────────
+/**
+ * FIX 3: generateRecommendations now accepts a single peak-posture snapshot
+ * (the frame that produced the peak RULA score) in addition to the full snapshot
+ * array. When peakSnapshot is provided, joint-angle thresholds are evaluated
+ * against the peak-frame angles, and recommendation text references that frame
+ * explicitly (e.g. "at peak posture") rather than "averaged".
+ *
+ * The full snapshots array is still used for task-level metrics (repRate, NIOSH)
+ * and for the fallback path when no peak snapshot is available.
+ */
 export function generateRecommendations(
   snapshots: ErgoSnapshot[],
   task: TaskProfile,
+  peakSnapshot?: ErgoSnapshot,
 ): string[] {
   if (!snapshots.length) return [];
   const recs: string[] = [];
+
+  // Use peak-frame angles when available; fall back to clip averages
+  const usePeak = !!peakSnapshot;
+  const angles = peakSnapshot?.angles;
+
   const avgA = (fn: (s: ErgoSnapshot) => number) =>
     snapshots.reduce((s, x) => s + fn(x), 0) / snapshots.length;
 
-  const neckFlex = avgA(s => s.angles.neckFlexion);
-  const trunkFlex = avgA(s => s.angles.trunkFlexion);
-  const trunkRot = avgA(s => s.angles.trunkRotation);
-  const maxUA = avgA(s => Math.max(s.angles.leftUpperArm, s.angles.rightUpperArm));
-  const maxWr = avgA(s => Math.max(s.angles.leftWrist, s.angles.rightWrist));
-  const avgRula = avgA(s => s.rula.score);
-  const avgReba = avgA(s => s.reba.score);
+  const neckFlex  = angles ? angles.neckFlexion  : avgA(s => s.angles.neckFlexion);
+  const trunkFlex = angles ? angles.trunkFlexion : avgA(s => s.angles.trunkFlexion);
+  const trunkRot  = angles ? angles.trunkRotation : avgA(s => s.angles.trunkRotation);
+  const maxUA     = angles ? Math.max(angles.leftUpperArm, angles.rightUpperArm) : avgA(s => Math.max(s.angles.leftUpperArm, s.angles.rightUpperArm));
+  const maxWr     = angles ? Math.max(angles.leftWrist, angles.rightWrist) : avgA(s => Math.max(s.angles.leftWrist, s.angles.rightWrist));
+
+  // For score-level recommendations, use peak scores (not averages)
+  const peakRula = peakSnapshot ? peakSnapshot.rula.score : avgA(s => s.rula.score);
+  const peakReba = peakSnapshot ? peakSnapshot.reba.score : avgA(s => s.reba.score);
+
   const nioshLI = task.loadWeight / Math.max(0.01, 23 * (task.horizontalDistance > 0 ? Math.min(1, 25 / task.horizontalDistance) : 1));
 
-  if (neckFlex > 20) recs.push(`Neck flexion averaged ${neckFlex.toFixed(0)}°. Raise the work surface or monitor to bring the head to a neutral position (0–10°).`);
-  if (trunkFlex > 20) recs.push(`Trunk flexion averaged ${trunkFlex.toFixed(0)}°. Adjust workstation height to allow an upright posture. Consider a height-adjustable table.`);
-  if (trunkRot > 15) recs.push(`Trunk rotation averaged ${trunkRot.toFixed(0)}°. Reposition materials to the front of the worker to eliminate twisting.`);
-  if (maxUA > 45) recs.push(`Shoulder elevation averaged ${maxUA.toFixed(0)}°. Lower the work surface or use a tool with an extended handle to reduce overhead reach.`);
-  if (maxWr > 15) recs.push(`Wrist deviation averaged ${maxWr.toFixed(0)}°. Use a neutral-grip tool or reorient the work piece to straighten the wrist.`);
+  const qualifier = usePeak ? 'at peak posture' : 'on average';
+
+  if (neckFlex > 20) recs.push(`Neck flexion ${qualifier}: ${neckFlex.toFixed(0)}°. Raise the work surface or monitor to bring the head to a neutral position (0–10°).`);
+  if (trunkFlex > 20) recs.push(`Trunk flexion ${qualifier}: ${trunkFlex.toFixed(0)}°. Adjust workstation height to allow an upright posture. Consider a height-adjustable table.`);
+  if (trunkRot > 15) recs.push(`Trunk rotation ${qualifier}: ${trunkRot.toFixed(0)}°. Reposition materials to the front of the worker to eliminate twisting.`);
+  if (maxUA > 45) recs.push(`Shoulder elevation ${qualifier}: ${maxUA.toFixed(0)}°. Lower the work surface or use a tool with an extended handle to reduce overhead reach.`);
+  if (maxWr > 15) recs.push(`Wrist deviation ${qualifier}: ${maxWr.toFixed(0)}°. Use a neutral-grip tool or reorient the work piece to straighten the wrist.`);
   if (task.repRate > 10) recs.push(`Repetition rate of ${task.repRate} reps/min is high. Introduce job rotation every 30–60 minutes to distribute exposure.`);
   if (task.loadWeight > 15) recs.push(`Load weight of ${task.loadWeight} kg exceeds recommended limits. Use a mechanical assist (hoist, lift table, or cart) for loads above 15 kg.`);
   if (nioshLI > 1) recs.push(`NIOSH Lifting Index of ${nioshLI.toFixed(2)} indicates risk. Reduce load, shorten horizontal reach, or raise the lift origin height.`);
-  if (avgRula >= 5) recs.push(`RULA score of ${avgRula.toFixed(1)} requires prompt investigation. Conduct a detailed ergonomics review with a qualified ergonomist.`);
-  if (avgReba >= 8) recs.push(`REBA score of ${avgReba.toFixed(1)} indicates high whole-body risk. Prioritize engineering controls before administrative measures.`);
+  if (peakRula >= 5) recs.push(`Peak RULA score of ${peakRula} requires prompt investigation. Conduct a detailed ergonomics review with a qualified ergonomist.`);
+  if (peakReba >= 8) recs.push(`Peak REBA score of ${peakReba} indicates high whole-body risk. Prioritize engineering controls before administrative measures.`);
   if (task.duration === 'long' && task.repRate > 4) recs.push('Long-duration repetitive task. Schedule mandatory micro-breaks every 20–30 minutes and provide stretching guidance.');
 
   if (recs.length === 0) recs.push('Posture and task parameters are within acceptable limits. Continue to monitor and reassess if the task changes.');
   return recs;
 }
 
-// ─── AUTO-GENERATE CORRECTIVE ACTIONS ────────────────────────────────────────
-export function generateActions(snapshots: ErgoSnapshot[], task: TaskProfile): CorrectiveAction[] {
-  const recs = generateRecommendations(snapshots, task);
-  const avgA = (fn: (s: ErgoSnapshot) => number) =>
-    snapshots.length ? snapshots.reduce((s, x) => s + fn(x), 0) / snapshots.length : 0;
-  const avgRula = avgA(s => s.rula.score);
-  const avgReba = avgA(s => s.reba.score);
+// ─── AUTO-GENERATE CORRECTIVE ACTIONS ────────────────────────────────────────────
+// FIX 3: generateActions now accepts an optional peakSnapshot so that action
+// descriptions reference peak-posture angles, not clip averages.
+export function generateActions(snapshots: ErgoSnapshot[], task: TaskProfile, peakSnapshot?: ErgoSnapshot): CorrectiveAction[] {
+  const recs = generateRecommendations(snapshots, task, peakSnapshot);
+  // Use peak scores for priority determination (not averages)
+  const peakRula = peakSnapshot ? peakSnapshot.rula.score : (snapshots.length ? Math.max(...snapshots.map(s => s.rula.score)) : 0);
+  const peakReba = peakSnapshot ? peakSnapshot.reba.score : (snapshots.length ? Math.max(...snapshots.map(s => s.reba.score)) : 0);
 
   return recs.map((rec, i) => ({
     id: `ACT-${Date.now().toString(36).toUpperCase()}-${i}`,
     description: rec,
     category: rec.includes('mechanical') || rec.includes('height') || rec.includes('tool') ? 'engineering' :
                rec.includes('rotation') || rec.includes('break') ? 'administrative' : 'engineering',
-    priority: (avgRula >= 6 || avgReba >= 10) ? 'critical' : (avgRula >= 4 || avgReba >= 7) ? 'high' : 'medium',
+    priority: (peakRula >= 6 || peakReba >= 10) ? 'critical' : (peakRula >= 4 || peakReba >= 7) ? 'high' : 'medium',
     status: 'open',
     riskDriver: rec.split('.')[0],
   }));
 }
-
 export function summarizeSession(
   snapshots: ErgoSnapshot[],
   task: TaskProfile,
@@ -1139,9 +1271,11 @@ export function summarizeSession(
     location: meta?.location,
     notes: meta?.notes,
     thumbnailDataUrl: meta?.thumbnailDataUrl,
-    actions: generateActions(snapshots, task),
-    bodyRegions: buildBodyRegions(snapshots),
-    recommendations: generateRecommendations(snapshots, task),
+    // FIX 3: Pass the peak RULA snapshot so recommendations and actions reference
+    // the worst-posture frame, not clip averages.
+    actions: generateActions(filteredSnapshots, task, filteredSnapshots[peakRulaFrame]),
+    bodyRegions: buildBodyRegions(filteredSnapshots),
+    recommendations: generateRecommendations(filteredSnapshots, task, filteredSnapshots[peakRulaFrame]),
     avgAngles: snapshots.length ? {
       neckFlexion: Math.round(avg(s => s.angles.neckFlexion) * 10) / 10,
       trunkFlexion: Math.round(avg(s => s.angles.trunkFlexion) * 10) / 10,
@@ -1153,5 +1287,19 @@ export function summarizeSession(
       leftKnee: Math.round(avg(s => s.angles.leftKnee) * 10) / 10,
       rightKnee: Math.round(avg(s => s.angles.rightKnee) * 10) / 10,
     } : undefined,
+    // FIX 3: Store the peak-frame angles separately so the report can display them
+    // as the authoritative evidence for the headline score.
+    peakAngles: filteredSnapshots.length ? {
+      neckFlexion:   Math.round((filteredSnapshots[peakRulaFrame]?.angles.neckFlexion   ?? 0) * 10) / 10,
+      trunkFlexion:  Math.round((filteredSnapshots[peakRulaFrame]?.angles.trunkFlexion  ?? 0) * 10) / 10,
+      leftUpperArm:  Math.round((filteredSnapshots[peakRulaFrame]?.angles.leftUpperArm  ?? 0) * 10) / 10,
+      rightUpperArm: Math.round((filteredSnapshots[peakRulaFrame]?.angles.rightUpperArm ?? 0) * 10) / 10,
+      leftWrist:     Math.round((filteredSnapshots[peakRulaFrame]?.angles.leftWrist     ?? 0) * 10) / 10,
+      rightWrist:    Math.round((filteredSnapshots[peakRulaFrame]?.angles.rightWrist    ?? 0) * 10) / 10,
+      hipFlexion:    Math.round((filteredSnapshots[peakRulaFrame]?.angles.hipFlexion    ?? 0) * 10) / 10,
+      leftKnee:      Math.round((filteredSnapshots[peakRulaFrame]?.angles.leftKnee      ?? 0) * 10) / 10,
+      rightKnee:     Math.round((filteredSnapshots[peakRulaFrame]?.angles.rightKnee     ?? 0) * 10) / 10,
+    } : undefined,
+    peakAnglesFrame: peakRulaFrame,
   };
 }
