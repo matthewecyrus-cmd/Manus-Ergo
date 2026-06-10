@@ -36,7 +36,16 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   const [sessions, setSessions] = useState<SessionRecord[]>(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : [];
+      if (!raw) return [];
+      const parsed: SessionRecord[] = JSON.parse(raw);
+      // Migration: backfill fields added after initial release so old stored sessions
+      // don't crash the report UI or PDF export.
+      return parsed.map(s => ({
+        ...s,
+        clampedFrames:    (s as any).clampedFrames    ?? 0,
+        sustainedPeakRula:(s as any).sustainedPeakRula ?? (s.peakRula ?? Math.round(s.avgRula)),
+        sustainedPeakReba:(s as any).sustainedPeakReba ?? (s.peakReba ?? Math.round(s.avgReba)),
+      }));
     } catch { return []; }
   });
 

@@ -144,6 +144,13 @@ const JOINT_SEG: Record<number, Seg> = {
 // Landmark coordinates from MediaPipe are relative to the RAW video frame (videoWidth x videoHeight).
 // The browser displays the video with CSS object-contain, which letterboxes it.
 // We must compute the same letterbox rect to map landmarks to canvas pixels.
+//
+// ROTATION HANDLING: Some devices (phones, tablets) embed a 90° rotation tag in the
+// video container. The browser auto-rotates the display so the video looks correct,
+// but videoWidth/videoHeight still reflect the raw (unrotated) frame dimensions.
+// We detect this by comparing the displayed aspect ratio to the raw aspect ratio:
+//   - If they differ significantly AND the inverse matches, the video is rotated.
+//   - In that case we swap effW/effH so the letterbox math uses the displayed geometry.
 function drawSkeleton(
   ctx: CanvasRenderingContext2D,
   W: number, H: number,
@@ -152,15 +159,18 @@ function drawSkeleton(
   riskColors: boolean,
   segColors: SegColors | null,
 ) {
-  // Letterbox: map normalized [0,1] landmark coords to the area the video
-  // actually occupies inside the canvas (object-contain letterboxing).
-  // MediaPipe normalizes landmarks to the decoded frame dimensions (videoWidth x videoHeight),
-  // so we use those directly — no rotation detection needed.
   const rawW = video.videoWidth  || W;
   const rawH = video.videoHeight || H;
-  const scale = Math.min(W / rawW, H / rawH);
-  const drawW = rawW * scale;
-  const drawH = rawH * scale;
+  // Rotation-aware letterbox: detect if browser has auto-rotated the video
+  // (e.g. portrait phone video with 90° EXIF tag stored as landscape raw frame)
+  const displayAR = (video.clientWidth  || W) / (video.clientHeight || H);
+  const rawAR     = rawW / rawH;
+  const isRotated = Math.abs(displayAR - rawAR) > 0.3 && Math.abs(displayAR - (1 / rawAR)) < 0.3;
+  const effW = isRotated ? rawH : rawW;
+  const effH = isRotated ? rawW : rawH;
+  const scale = Math.min(W / effW, H / effH);
+  const drawW = effW * scale;
+  const drawH = effH * scale;
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
 
@@ -468,16 +478,20 @@ export default function VideoUpload() {
       // Draw video frame + skeleton onto an offscreen canvas for the thumbnail
       if (!thumbnailCapturedRef.current && video.duration > 0 && video.currentTime >= video.duration * 0.25) {
         thumbnailCapturedRef.current = true;
-        try {
+          try {
           const thumb = document.createElement('canvas');
           thumb.width = W; thumb.height = H;
           const tCtx = thumb.getContext('2d')!;
-          // Draw video frame (handles rotation via CSS, but drawImage uses raw frame)
-          // Use same letterbox math as the overlay
-          const rawW = video.videoWidth || W;
-          const rawH = video.videoHeight || H;
-          const scale = Math.min(W / rawW, H / rawH);
-          const dW = rawW * scale; const dH = rawH * scale;
+          // Draw video frame — use rotation-aware letterbox (same as overlay)
+          const tRawW = video.videoWidth || W;
+          const tRawH = video.videoHeight || H;
+          const tDisplayAR = (video.clientWidth || W) / (video.clientHeight || H);
+          const tRawAR = tRawW / tRawH;
+          const tRotated = Math.abs(tDisplayAR - tRawAR) > 0.3 && Math.abs(tDisplayAR - (1 / tRawAR)) < 0.3;
+          const tEffW = tRotated ? tRawH : tRawW;
+          const tEffH = tRotated ? tRawW : tRawH;
+          const tScale = Math.min(W / tEffW, H / tEffH);
+          const dW = tEffW * tScale; const dH = tEffH * tScale;
           const dX = (W - dW) / 2; const dY = (H - dH) / 2;
           tCtx.fillStyle = '#000';
           tCtx.fillRect(0, 0, W, H);

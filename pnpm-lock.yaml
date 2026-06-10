@@ -16,6 +16,9 @@ importers:
 
   .:
     dependencies:
+      '@babel/runtime':
+        specifier: ^7.29.7
+        version: 7.29.7
       '@hookform/resolvers':
         specifier: ^5.2.2
         version: 5.2.2(react-hook-form@7.64.0(react@19.2.1))
@@ -324,10 +327,6 @@ packages:
     engines: {node: '>=6.9.0'}
     peerDependencies:
       '@babel/core': ^7.0.0-0
-
-  '@babel/runtime@7.28.4':
-    resolution: {integrity: sha512-Q/N6JNWvIvPnLDvjlE1OUBLPQHH6l3CltCEsHIujp45zQUSSh8K+gHnaEX45yAT1nyngnINhvWtzN+Nb9D8RAQ==}
-    engines: {node: '>=6.9.0'}
 
   '@babel/runtime@7.29.7':
     resolution: {integrity: sha512-Nq8OhGWiZIZGV6hLHoyAKLLcJihP/xFeBMGJoUrxTX2psI8dCifzLhZISFb+VWS3wFMRDmCGw5R+dOySCqPLhw==}
@@ -3718,8 +3717,6 @@ snapshots:
       '@babel/core': 7.28.4
       '@babel/helper-plugin-utils': 7.27.1
 
-  '@babel/runtime@7.28.4': {}
-
   '@babel/runtime@7.29.7': {}
 
   '@babel/template@7.27.2':
@@ -5535,7 +5532,7 @@ snapshots:
 
   dom-helpers@5.2.1:
     dependencies:
-      '@babel/runtime': 7.28.4
+      '@babel/runtime': 7.29.7
       csstype: 3.1.3
 
   dompurify@3.3.0:
@@ -6766,7 +6763,7 @@ snapshots:
 
   react-transition-group@4.4.5(react-dom@19.2.1(react@19.2.1))(react@19.2.1):
     dependencies:
-      '@babel/runtime': 7.28.4
+      '@babel/runtime': 7.29.7
       dom-helpers: 5.2.1
       loose-envify: 1.4.0
       prop-types: 15.8.1

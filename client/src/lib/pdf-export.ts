@@ -2,15 +2,17 @@
  * pdf-export.ts — ErgoKit
  * =======================
  * Generates a professional multi-page PDF report from a SessionRecord.
- * Uses jsPDF for PDF generation (no html2canvas — pure programmatic PDF).
+ * Uses jsPDF for PDF generation (pure programmatic PDF, no html2canvas).
  *
  * Layout:
- *   Page 1: Cover / summary — session metadata, risk badge, score cards
- *   Page 2: Body Region Risk Map (bar chart), Average Joint Angles
+ *   Page 1: Cover / summary — session metadata, risk badge, tracking quality,
+ *            sustained-peak evidence, score cards (peak + sustained)
+ *   Page 2: Body Region Risk Map, Peak-Frame Joint Angles
  *   Page 3: Recommendations + Corrective Actions
  *   Page N: Thumbnail (if available)
  */
 import type { SessionRecord, BodyAngles, RiskLevel } from './ergo-engine';
+import { jsPDF } from 'jspdf';
 
 // ─── Color helpers ─────────────────────────────────────────────────────────────
 function riskRgb(level: RiskLevel): [number, number, number] {
@@ -43,7 +45,7 @@ function scoreRsiRisk(s: number): RiskLevel {
   return s >= 40 ? 'high' : s >= 20 ? 'medium' : 'low';
 }
 function normalizeRisk(level: string): RiskLevel {
-  if (level === 'negligible') return 'low';
+  if (level === 'negligible') return 'negligible';
   if (level === 'very-high') return 'very-high';
   if (level === 'high') return 'high';
   if (level === 'medium') return 'medium';
@@ -137,6 +139,30 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
   doc.text(`Peak Risk: ${riskLabel(session.peakRisk)}`, MARGIN + 4, y + 5.5);
   y += 14;
 
+  // ─── Tracking Quality Banner ──────────────────────────────────────────────────
+  const totalFrames = session.snapshots.length;
+  const clampedFrames = session.clampedFrames ?? 0;
+  const clampedPct = totalFrames > 0 ? Math.round((clampedFrames / totalFrames) * 100) : 0;
+  const trackingQuality = clampedPct === 0 ? 'Excellent' : clampedPct < 10 ? 'Good' : clampedPct < 25 ? 'Fair' : 'Poor';
+  const trackingColor: [number, number, number] = clampedPct === 0 ? [34, 197, 94] : clampedPct < 10 ? [34, 197, 94] : clampedPct < 25 ? [234, 179, 8] : [239, 68, 68];
+
+  setFill(trackingColor[0], trackingColor[1], trackingColor[2]);
+  doc.roundedRect(MARGIN, y, 4, 8, 1, 1, 'F');
+  setFill(248, 250, 252);
+  setDraw(226, 232, 240);
+  doc.setLineWidth(0.3);
+  doc.roundedRect(MARGIN + 4, y, CONTENT_W - 4, 8, 1, 1, 'FD');
+  setFont(8, 'bold');
+  setColor(trackingColor[0], trackingColor[1], trackingColor[2]);
+  doc.text(`Tracking Quality: ${trackingQuality}`, MARGIN + 8, y + 5.5);
+  setFont(7);
+  setColor(100, 116, 139);
+  const trackingText = clampedFrames === 0
+    ? `All ${totalFrames} frames passed the anatomical plausibility check.`
+    : `${clampedFrames} of ${totalFrames} frames (${clampedPct}%) had at least one joint angle clamped.`;
+  doc.text(trackingText, MARGIN + 65, y + 5.5);
+  y += 14;
+
   // Divider
   setDraw(226, 232, 240);
   doc.setLineWidth(0.3);
@@ -159,21 +185,46 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
   doc.text(summaryLines, MARGIN, y);
   y += summaryLines.length * 5 + 8;
 
-  // ─── Score cards (2×2 grid) ───────────────────────────────────────────────────
+  // ─── Score cards (2×2 grid) — Peak + Sustained ───────────────────────────────
   setFont(11, 'bold');
   setColor(15, 23, 42);
   doc.text('Assessment Scores', MARGIN, y);
   y += 7;
 
+  const peakRula = session.peakRula ?? Math.round(session.avgRula);
+  const peakReba = session.peakReba ?? Math.round(session.avgReba);
+  const sustainedRula = session.sustainedPeakRula ?? peakRula;
+  const sustainedReba = session.sustainedPeakReba ?? peakReba;
+
   const scores = [
-    { label: 'RULA', fullName: 'Rapid Upper Limb Assessment', score: session.avgRula, risk: scoreRulaRisk(session.avgRula) as RiskLevel, max: 7 },
-    { label: 'REBA', fullName: 'Rapid Entire Body Assessment', score: session.avgReba, risk: scoreRebaRisk(session.avgReba) as RiskLevel, max: 15 },
-    { label: 'NIOSH LI', fullName: 'NIOSH Lifting Index', score: session.avgNiosh, risk: scoreNioshRisk(session.avgNiosh) as RiskLevel, max: 3 },
-    { label: 'RSI', fullName: 'Repetitive Strain Index', score: session.avgRsi, risk: scoreRsiRisk(session.avgRsi) as RiskLevel, max: 60 },
+    {
+      label: 'RULA', fullName: 'Rapid Upper Limb Assessment',
+      score: peakRula, sustained: sustainedRula,
+      risk: scoreRulaRisk(peakRula) as RiskLevel, max: 7,
+      nioshNA: false,
+    },
+    {
+      label: 'REBA', fullName: 'Rapid Entire Body Assessment',
+      score: peakReba, sustained: sustainedReba,
+      risk: scoreRebaRisk(peakReba) as RiskLevel, max: 15,
+      nioshNA: false,
+    },
+    {
+      label: 'NIOSH LI', fullName: 'NIOSH Lifting Index',
+      score: session.avgNiosh, sustained: null,
+      risk: scoreNioshRisk(session.avgNiosh) as RiskLevel, max: 3,
+      nioshNA: session.avgNiosh === 0 && session.taskProfile?.loadWeight === 0,
+    },
+    {
+      label: 'RSI', fullName: 'Repetitive Strain Index',
+      score: session.avgRsi, sustained: null,
+      risk: scoreRsiRisk(session.avgRsi) as RiskLevel, max: 60,
+      nioshNA: session.avgRsi === 0 && (session.taskProfile?.repRate ?? 0) < 2,
+    },
   ];
 
   const cardW = (CONTENT_W - 6) / 2;
-  const cardH = 28;
+  const cardH = 32;
   const col2X = MARGIN + cardW + 6;
 
   for (let i = 0; i < scores.length; i++) {
@@ -182,7 +233,7 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
     if (i % 2 === 0 && i > 0) y += cardH + 4;
     checkPage(cardH + 4);
 
-    const [sr, sg, sb] = riskRgb(s.risk);
+    const [sr, sg, sb] = s.nioshNA ? [148, 163, 184] : riskRgb(s.risk);
 
     // Card background
     setFill(248, 250, 252);
@@ -199,35 +250,66 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
     setColor(15, 23, 42);
     doc.text(s.label, cx + 7, y + 6);
 
+    // PEAK label
+    setFont(6, 'bold');
+    setColor(100, 116, 139);
+    doc.text('PEAK', cx + 7, y + 10.5);
+
     // Full name
     setFont(7);
     setColor(100, 116, 139);
-    doc.text(s.fullName, cx + 7, y + 11);
+    doc.text(s.fullName, cx + 7, y + 15);
 
-    // Score number
-    setFont(18, 'bold');
-    setColor(sr, sg, sb);
-    doc.text(s.score.toFixed(1), cx + 7, y + 23);
+    if (s.nioshNA) {
+      // N/A display
+      setFont(14, 'bold');
+      setColor(148, 163, 184);
+      doc.text('N/A', cx + 7, y + 26);
+      setFont(6);
+      setColor(148, 163, 184);
+      doc.text('Not applicable for this task', cx + 7, y + 30);
+    } else {
+      // Score number (peak)
+      setFont(18, 'bold');
+      setColor(sr, sg, sb);
+      doc.text(s.score.toFixed(0), cx + 7, y + 26);
 
-    // Risk label
-    setFont(8, 'bold');
-    setColor(sr, sg, sb);
-    doc.text(riskLabel(s.risk), cx + 28, y + 23);
+      // Risk label
+      setFont(8, 'bold');
+      setColor(sr, sg, sb);
+      doc.text(riskLabel(s.risk), cx + 22, y + 26);
 
-    // Progress bar background
-    const barX = cx + 7;
-    const barY = y + 25.5;
-    const barW = cardW - 14;
-    setFill(226, 232, 240);
-    doc.roundedRect(barX, barY, barW, 1.5, 0.5, 0.5, 'F');
-    // Progress bar fill
-    const pct = Math.min(1, s.score / s.max);
-    setFill(sr, sg, sb);
-    doc.roundedRect(barX, barY, barW * pct, 1.5, 0.5, 0.5, 'F');
+      // Sustained peak (if available)
+      if (s.sustained !== null && s.sustained !== undefined) {
+        const sustainedRisk = s.label === 'RULA' ? scoreRulaRisk(s.sustained) : scoreRebaRisk(s.sustained);
+        const [susr, susg, susb] = riskRgb(sustainedRisk);
+        setFont(6);
+        setColor(100, 116, 139);
+        doc.text('Sustained (≥3 frames):', cx + 7, y + 30);
+        setFont(7, 'bold');
+        setColor(susr, susg, susb);
+        doc.text(String(s.sustained), cx + 46, y + 30);
+        if (s.sustained < s.score) {
+          setFont(6);
+          setColor(59, 130, 246);
+          doc.text(`(${s.score - s.sustained} below abs. peak)`, cx + 52, y + 30);
+        }
+      }
+
+      // Progress bar
+      const barX = cx + 7;
+      const barY = y + 32.5;
+      const barW = cardW - 14;
+      setFill(226, 232, 240);
+      doc.roundedRect(barX, barY - 2, barW, 1.5, 0.5, 0.5, 'F');
+      const pct = Math.min(1, s.score / s.max);
+      setFill(sr, sg, sb);
+      doc.roundedRect(barX, barY - 2, barW * pct, 1.5, 0.5, 0.5, 'F');
+    }
   }
   y += cardH + 10;
 
-  // ─── PAGE 2: Body Region Risk Map + Joint Angles ──────────────────────────────
+  // ─── PAGE 2: Body Region Risk Map + Peak-Frame Joint Angles ──────────────────
   checkPage(60);
 
   setFont(11, 'bold');
@@ -244,19 +326,15 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
       const [br, bg, bb] = riskRgb(normalizeRisk(region.riskLevel));
       const pct = Math.min(1, region.score / 10);
 
-      // Label
       setFont(8);
       setColor(51, 65, 85);
       doc.text(region.region, MARGIN, y + 5);
 
-      // Bar background
       setFill(241, 245, 249);
       doc.roundedRect(MARGIN + 55, y + 1, barMaxW, 5, 1, 1, 'F');
-      // Bar fill
       setFill(br, bg, bb);
       doc.roundedRect(MARGIN + 55, y + 1, barMaxW * pct, 5, 1, 1, 'F');
 
-      // Score
       setFont(8, 'bold');
       setColor(br, bg, bb);
       doc.text(region.score.toFixed(1), MARGIN + 55 + barMaxW + 3, y + 5.5);
@@ -271,62 +349,68 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
     y += 10;
   }
 
-  // ─── Average Joint Angles ─────────────────────────────────────────────────────
+  // ─── Peak-Frame Joint Angles (primary) ───────────────────────────────────────
   checkPage(30);
 
   setFont(11, 'bold');
   setColor(15, 23, 42);
-  doc.text('Average Joint Angles', MARGIN, y);
-  y += 7;
+  doc.text('Peak-Posture Frame Angles', MARGIN, y);
+  setFont(7);
+  setColor(100, 116, 139);
+  doc.text('Joint angles at the worst-posture frame — the evidence that justifies the headline score', MARGIN, y + 5);
+  y += 12;
 
   const ANGLE_SAFE_RANGES: Record<string, { safe: [number, number]; label: string }> = {
-    neckFlexion:   { safe: [-20, 20],  label: 'Neck Flexion' },
-    trunkFlexion:  { safe: [-20, 20],  label: 'Trunk Flexion' },
-    leftUpperArm:  { safe: [0, 20],    label: 'L. Shoulder Elevation' },
-    rightUpperArm: { safe: [0, 20],    label: 'R. Shoulder Elevation' },
-    leftWrist:     { safe: [-15, 15],  label: 'L. Wrist Deviation' },
-    rightWrist:    { safe: [-15, 15],  label: 'R. Wrist Deviation' },
-    hipFlexion:    { safe: [-30, 30],  label: 'Hip Flexion' },
-    leftKnee:      { safe: [0, 30],    label: 'L. Knee Bend' },
-    rightKnee:     { safe: [0, 30],    label: 'R. Knee Bend' },
+    neckFlexion:   { safe: [0, 20],  label: 'Neck Flexion' },
+    trunkFlexion:  { safe: [0, 20],  label: 'Trunk Flexion' },
+    leftUpperArm:  { safe: [0, 20],  label: 'L. Shoulder Elevation' },
+    rightUpperArm: { safe: [0, 20],  label: 'R. Shoulder Elevation' },
+    leftWrist:     { safe: [0, 15],  label: 'L. Wrist Deviation' },
+    rightWrist:    { safe: [0, 15],  label: 'R. Wrist Deviation' },
+    hipFlexion:    { safe: [0, 30],  label: 'Hip Flexion' },
+    leftKnee:      { safe: [0, 30],  label: 'L. Knee Bend' },
+    rightKnee:     { safe: [0, 30],  label: 'R. Knee Bend' },
   };
 
-  const avgAngles = session.avgAngles as Partial<BodyAngles> | undefined;
-  if (avgAngles && Object.keys(avgAngles).length > 0) {
-    for (const [key, value] of Object.entries(avgAngles)) {
+  // Use peak-frame angles as primary; fall back to avg angles
+  const displayAngles = (session.peakAngles ?? session.avgAngles) as Partial<BodyAngles> | undefined;
+  const anglesLabel = session.peakAngles ? 'Peak Frame' : 'Clip Average';
+
+  if (displayAngles && Object.keys(displayAngles).length > 0) {
+    setFont(7, 'italic');
+    setColor(100, 116, 139);
+    doc.text(`Source: ${anglesLabel}`, MARGIN, y);
+    y += 5;
+
+    for (const [key, value] of Object.entries(displayAngles)) {
       const info = ANGLE_SAFE_RANGES[key];
       if (!info || typeof value !== 'number') continue;
-      checkPage(8);
+      checkPage(10);
 
       const [lo, hi] = info.safe;
-      const margin = (hi - lo) * 0.5;
       const inSafe = value >= lo && value <= hi;
-      const inCaution = !inSafe && value >= lo - margin && value <= hi + margin;
-      const risk: RiskLevel = inSafe ? 'low' : inCaution ? 'medium' : 'high'; // always valid
+      const risk: RiskLevel = inSafe ? 'low' : value > hi * 1.5 ? 'high' : 'medium';
       const [ar, ag, ab] = riskRgb(risk);
 
       setFont(8);
       setColor(51, 65, 85);
       doc.text(info.label, MARGIN, y + 5);
 
-      // Bar
       const barMaxW2 = CONTENT_W - 70;
-      const maxRange = Math.max(Math.abs(lo), Math.abs(hi)) * 2.5;
+      const maxRange = hi * 3;
       const pct2 = Math.min(1, Math.abs(value) / maxRange);
       setFill(241, 245, 249);
       doc.roundedRect(MARGIN + 60, y + 1, barMaxW2, 5, 1, 1, 'F');
       setFill(ar, ag, ab);
       doc.roundedRect(MARGIN + 60, y + 1, barMaxW2 * pct2, 5, 1, 1, 'F');
 
-      // Value
       setFont(8, 'bold');
       setColor(ar, ag, ab);
       doc.text(`${value.toFixed(1)}°`, MARGIN + 60 + barMaxW2 + 3, y + 5.5);
 
-      // Safe range annotation
       setFont(6);
       setColor(148, 163, 184);
-      doc.text(`Safe: ${lo}° to ${hi}°`, MARGIN + 60, y + 9);
+      doc.text(`Safe: 0° to ${hi}°`, MARGIN + 60, y + 9);
 
       y += 11;
     }
@@ -354,20 +438,17 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
       const blockH = lines.length * 5 + 6;
       checkPage(blockH + 2);
 
-      // Background
       setFill(255, 251, 235);
       setDraw(253, 230, 138);
       doc.setLineWidth(0.3);
       doc.roundedRect(MARGIN, y, CONTENT_W, blockH, 2, 2, 'FD');
 
-      // Number badge
       setFill(217, 119, 6);
       doc.circle(MARGIN + 5, y + blockH / 2, 3.5, 'F');
       setFont(7, 'bold');
       setColor(255, 255, 255);
       doc.text(String(i + 1), MARGIN + 5, y + blockH / 2 + 2.5, { align: 'center' });
 
-      // Text
       setFont(8);
       setColor(51, 65, 85);
       doc.text(lines, MARGIN + 12, y + 5.5);
@@ -401,7 +482,6 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
       doc.setLineWidth(0.3);
       doc.roundedRect(MARGIN, y, CONTENT_W, blockH, 2, 2, 'FD');
 
-      // Priority badge
       const priorityColors: Record<string, [number, number, number]> = {
         critical: [239, 68, 68], high: [249, 115, 22], medium: [234, 179, 8], low: [100, 116, 139],
       };
@@ -412,7 +492,6 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
       setColor(255, 255, 255);
       doc.text(action.priority.toUpperCase(), MARGIN + 12, y + 6.5, { align: 'center' });
 
-      // Status
       const statusColors: Record<string, [number, number, number]> = {
         open: [100, 116, 139], 'in-progress': [59, 130, 246], completed: [34, 197, 94], verified: [16, 185, 129],
       };
@@ -421,7 +500,6 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
       setColor(str, stg, stb);
       doc.text(action.status.replace('-', ' ').toUpperCase(), MARGIN + 25, y + 6.5);
 
-      // Description
       setFont(8);
       setColor(51, 65, 85);
       doc.text(lines, MARGIN + 48, y + 5.5);
@@ -440,13 +518,15 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
 
     setFont(11, 'bold');
     setColor(15, 23, 42);
-    doc.text('Session Thumbnail', MARGIN, y);
-    y += 6;
+    doc.text('Session Thumbnail — Peak-Posture Frame', MARGIN, y);
+    setFont(7);
+    setColor(100, 116, 139);
+    doc.text('Captured from the frame that produced the highest RULA score', MARGIN, y + 5);
+    y += 12;
 
     try {
-      // Fit image to page width
       const imgW = CONTENT_W;
-      const imgH = imgW * (9 / 16); // assume 16:9
+      const imgH = imgW * (9 / 16);
       doc.addImage(thumbUrl, 'JPEG', MARGIN, y, imgW, imgH);
       y += imgH + 4;
     } catch {
@@ -474,7 +554,7 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
   checkPage(12);
   setFont(7);
   setColor(148, 163, 184);
-  const disclaimer = 'This report is generated automatically by computer vision analysis. Results should be reviewed by a qualified ergonomist for critical decisions.';
+  const disclaimer = 'This report is generated automatically by computer vision analysis. Results should be reviewed by a qualified ergonomist for critical decisions. Sustained peak scores represent the highest risk level maintained for ≥3 consecutive frames; absolute peak scores represent the single worst frame.';
   const disclaimerLines = doc.splitTextToSize(disclaimer, CONTENT_W);
   doc.text(disclaimerLines, MARGIN, y);
 

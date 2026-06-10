@@ -1025,6 +1025,45 @@ export default function SessionReport() {
         <p className="text-sm text-muted-foreground">{session.taskName} · {session.id} · {session.date}</p>
       </div>
 
+      {/* Tracking Quality Badge */}
+      {(() => {
+        const total = session.snapshots.length;
+        const clamped = session.clampedFrames ?? 0;
+        const pct = total > 0 ? Math.round((clamped / total) * 100) : 0;
+        const quality = pct === 0 ? 'excellent' : pct < 10 ? 'good' : pct < 25 ? 'fair' : 'poor';
+        const qColors = {
+          excellent: 'bg-green-50 border-green-200 text-green-800',
+          good:      'bg-green-50 border-green-200 text-green-800',
+          fair:      'bg-amber-50 border-amber-200 text-amber-800',
+          poor:      'bg-red-50 border-red-200 text-red-800',
+        };
+        const qIcons = { excellent: '✅', good: '✅', fair: '⚠️', poor: '🔴' };
+        return (
+          <div className={`flex items-center gap-3 px-4 py-2.5 rounded-lg border text-sm ${qColors[quality]}`}>
+            <span className="text-base">{qIcons[quality]}</span>
+            <div className="flex-1">
+              <span className="font-semibold">Tracking Quality: {quality.charAt(0).toUpperCase() + quality.slice(1)}</span>
+              <span className="ml-2 font-normal opacity-80">
+                {clamped === 0
+                  ? `All ${total} frames passed the anatomical plausibility check.`
+                  : `${clamped} of ${total} frames (${pct}%) had at least one joint angle clamped by the plausibility guard.`
+                }
+              </span>
+            </div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button className="opacity-60 hover:opacity-100 transition-opacity">
+                  <HelpCircle className="w-4 h-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-xs">
+                <p className="text-xs">The plausibility guard checks every joint angle against published physiological limits (Kapandji 2008). Clamped frames had at least one angle outside the anatomically possible range — typically caused by fast motion blur, partial occlusion, or landmark swaps. Scores from clamped frames are down-weighted in the outlier filter. A high clamped-frame ratio (&gt;25%) suggests the video quality or camera angle may limit assessment reliability.</p>
+              </TooltipContent>
+            </Tooltip>
+          </div>
+        );
+      })()}
+
       {/* Plain-English Summary */}
       <Card className={`border-l-4 ${isHighRisk ? 'border-l-red-500 bg-red-50/40' : isMedRisk ? 'border-l-amber-500 bg-amber-50/40' : 'border-l-green-500 bg-green-50/40'}`}>
         <CardContent className="p-5">
@@ -1055,6 +1094,57 @@ export default function SessionReport() {
           Assessment Scores
           <span className="text-xs font-normal text-muted-foreground ml-1">Click "What does this score mean?" on any card to learn more</span>
         </h2>
+
+        {/* Sustained Peak Summary Row */}
+        {(session.sustainedPeakRula != null || session.sustainedPeakReba != null) && (
+          <div className="mb-4 flex flex-wrap gap-3 p-3 bg-slate-50 rounded-lg border border-slate-200">
+            <div className="flex items-center gap-1.5 text-sm">
+              <TrendingUp className="w-4 h-4 text-slate-500" />
+              <span className="font-semibold text-slate-700">Sustained Peak</span>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button className="text-muted-foreground hover:text-foreground">
+                    <HelpCircle className="w-3.5 h-3.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-xs">
+                  <p className="text-xs">The highest score maintained for at least 3 consecutive frames. Unlike the absolute peak (which may be a single-frame tracking artifact), the sustained peak represents a genuine posture held long enough to cause injury. Use this value for intervention planning.</p>
+                </TooltipContent>
+              </Tooltip>
+            </div>
+            <div className="flex gap-4 ml-1">
+              {session.sustainedPeakRula != null && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-muted-foreground">RULA</span>
+                  <span className="text-lg font-black leading-none" style={{ color: riskColor(session.sustainedPeakRula >= 7 ? 'very-high' : session.sustainedPeakRula >= 5 ? 'high' : session.sustainedPeakRula >= 3 ? 'medium' : 'low') }}>
+                    {session.sustainedPeakRula}
+                  </span>
+                  <span className="text-xs text-muted-foreground">/7</span>
+                  {session.sustainedPeakRula < peakRula && (
+                    <span className="text-[10px] px-1.5 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 rounded-full">
+                      {peakRula - session.sustainedPeakRula} below abs. peak
+                    </span>
+                  )}
+                </div>
+              )}
+              {session.sustainedPeakReba != null && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-muted-foreground">REBA</span>
+                  <span className="text-lg font-black leading-none" style={{ color: riskColor(session.sustainedPeakReba >= 11 ? 'very-high' : session.sustainedPeakReba >= 8 ? 'high' : session.sustainedPeakReba >= 4 ? 'medium' : session.sustainedPeakReba >= 2 ? 'low' : 'negligible') }}>
+                    {session.sustainedPeakReba}
+                  </span>
+                  <span className="text-xs text-muted-foreground">/15</span>
+                  {session.sustainedPeakReba < peakReba && (
+                    <span className="text-[10px] px-1.5 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 rounded-full">
+                      {peakReba - session.sustainedPeakReba} below abs. peak
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <ScoreCard type="rula" score={peakRula} riskLevel={rulaRisk} isPeak />
           <ScoreCard type="reba" score={peakReba} riskLevel={rebaRisk} isPeak />

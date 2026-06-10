@@ -1089,6 +1089,23 @@ export interface SessionRecord {
   peakAngles?: Record<string, number>;
   /** Frame index (within snapshots[]) that peakAngles was taken from */
   peakAnglesFrame?: number;
+  /**
+   * Number of frames where the plausibility guard clamped at least one joint angle.
+   * Used for the Tracking Quality indicator in the session report header.
+   * A high ratio (clampedFrames / snapshots.length) suggests unreliable tracking.
+   */
+  clampedFrames: number;
+  /**
+   * Sustained peak RULA score — the highest RULA score that was maintained for
+   * at least 3 consecutive frames. Filters out single-frame spikes caused by
+   * tracking artifacts. More actionable than the absolute peak for intervention planning.
+   */
+  sustainedPeakRula: number;
+  /**
+   * Sustained peak REBA score — the highest REBA score maintained for ≥3 consecutive
+   * frames. Same rationale as sustainedPeakRula.
+   */
+  sustainedPeakReba: number;
 }
 
 // ─── BODY REGION RISK BUILDER ────────────────────────────────────────────────
@@ -1248,6 +1265,31 @@ export function summarizeSession(
     ? Math.round(filteredSnapshots.filter(s => s.reba.score >= 8).length / filteredSnapshots.length * 100)
     : 0;
 
+  // ── Tracking quality: count frames clamped by the plausibility guard ──────
+  // computeSnapshot caps confidence to LOW_CONFIDENCE_FRAME_THRESHOLD (0.55) when
+  // any joint was implausible. We use that as a proxy for "clamped frame".
+  const clampedFrames = filteredSnapshots.filter(
+    s => s.rula.confidence <= LOW_CONFIDENCE_FRAME_THRESHOLD ||
+         s.reba.confidence <= LOW_CONFIDENCE_FRAME_THRESHOLD
+  ).length;
+
+  // ── Sustained peak scores (≥3 consecutive frames at that level) ──────────
+  // Sliding-window: find the highest score that appears in any run of ≥3
+  // consecutive frames. Falls back to the absolute peak if no run exists.
+  function sustainedPeak(scores: number[]): number {
+    if (scores.length < 3) return scores.length ? Math.max(...scores) : 0;
+    let best = 0;
+    for (let i = 0; i <= scores.length - 3; i++) {
+      const window = [scores[i], scores[i + 1], scores[i + 2]];
+      const windowMin = Math.min(...window);
+      if (windowMin > best) best = windowMin;
+    }
+    // If no 3-frame run found (all windows have variance), fall back to absolute peak
+    return best > 0 ? best : Math.max(...scores);
+  }
+  const sustainedPeakRula = sustainedPeak(filteredSnapshots.map(s => s.rula.score));
+  const sustainedPeakReba = sustainedPeak(filteredSnapshots.map(s => s.reba.score));
+
   return {
     id: `ERG-${Date.now().toString(36).toUpperCase()}`,
     taskName: task.taskName,
@@ -1301,5 +1343,8 @@ export function summarizeSession(
       rightKnee:     Math.round((filteredSnapshots[peakRulaFrame]?.angles.rightKnee     ?? 0) * 10) / 10,
     } : undefined,
     peakAnglesFrame: peakRulaFrame,
+    clampedFrames,
+    sustainedPeakRula,
+    sustainedPeakReba,
   };
 }

@@ -167,6 +167,9 @@ export const MOCK_SESSION_BASELINE: SessionRecord = {
     leftLowerArm: 95, rightLowerArm: 92, leftWrist: 8, rightWrist: 18,
     leftKnee: 172, rightKnee: 175, hipFlexion: 12,
   },
+  clampedFrames: 0,
+  sustainedPeakRula: 7,
+  sustainedPeakReba: 9,
 };
 
 export const MOCK_SESSION_FOLLOWUP: SessionRecord = {
@@ -214,6 +217,9 @@ export const MOCK_SESSION_FOLLOWUP: SessionRecord = {
     leftLowerArm: 88, rightLowerArm: 85, leftWrist: 5, rightWrist: 10,
     leftKnee: 174, rightKnee: 176, hipFlexion: 8,
   },
+  clampedFrames: 0,
+  sustainedPeakRula: 4,
+  sustainedPeakReba: 4,
 };
 
 // Multiple sessions for job profile / trend / rollup reports
@@ -246,6 +252,9 @@ export const MOCK_SESSIONS_MULTI: SessionRecord[] = [
     bodyRegions: makeBodyRegions(5.1, 5.8),
     recommendations: ['Reduce repetition rate to <10/min.', 'Provide wrist support.'],
     avgAngles: { neckFlexion: 18, trunkFlexion: 12, leftUpperArm: 28, rightUpperArm: 35, leftWrist: 22, rightWrist: 25, leftKnee: 170, rightKnee: 172, hipFlexion: 10, leftLowerArm: 90, rightLowerArm: 88 },
+    clampedFrames: 0,
+    sustainedPeakRula: 6,
+    sustainedPeakReba: 7,
   },
   {
     id: 'ERG-MOCK-004',
@@ -273,6 +282,9 @@ export const MOCK_SESSIONS_MULTI: SessionRecord[] = [
     bodyRegions: makeBodyRegions(4.2, 9.1),
     recommendations: ['Mechanical lift assist required immediately.', 'Redesign pallet height.'],
     avgAngles: { neckFlexion: 28, trunkFlexion: 45, leftUpperArm: 42, rightUpperArm: 48, leftWrist: 12, rightWrist: 15, leftKnee: 145, rightKnee: 148, hipFlexion: 55, leftLowerArm: 102, rightLowerArm: 98 },
+    clampedFrames: 0,
+    sustainedPeakRula: 6,
+    sustainedPeakReba: 11,
   },
   {
     id: 'ERG-MOCK-005',
@@ -300,6 +312,9 @@ export const MOCK_SESSIONS_MULTI: SessionRecord[] = [
     bodyRegions: makeBodyRegions(2.8, 2.5),
     recommendations: ['Adjust monitor height to reduce neck flexion.'],
     avgAngles: { neckFlexion: 15, trunkFlexion: 5, leftUpperArm: 18, rightUpperArm: 20, leftWrist: 4, rightWrist: 5, leftKnee: 90, rightKnee: 92, hipFlexion: 88, leftLowerArm: 95, rightLowerArm: 92 },
+    clampedFrames: 0,
+    sustainedPeakRula: 3,
+    sustainedPeakReba: 3,
   },
   {
     id: 'ERG-MOCK-006',
@@ -327,6 +342,9 @@ export const MOCK_SESSIONS_MULTI: SessionRecord[] = [
     bodyRegions: makeBodyRegions(7.0, 11.2),
     recommendations: ['Redesign fixture to allow neutral neck posture.', 'Limit overhead welding to 30 min/hr.'],
     avgAngles: { neckFlexion: 35, trunkFlexion: 22, leftUpperArm: 88, rightUpperArm: 92, leftWrist: 20, rightWrist: 22, leftKnee: 168, rightKnee: 170, hipFlexion: 18, leftLowerArm: 110, rightLowerArm: 105 },
+    clampedFrames: 0,
+    sustainedPeakRula: 7,
+    sustainedPeakReba: 12,
   },
 ];
 
