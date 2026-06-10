@@ -32,10 +32,10 @@ import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useSession } from '@/contexts/SessionContext';
-import { riskBgClass, riskLabel, riskColor, buildBodyRegions, generateRecommendations, extractAngles } from '@/lib/ergo-engine';
+import { riskBgClass, riskLabel, riskColor, buildBodyRegions, generateRecommendations, extractAngles, MOTION_PROFILES, DEFAULT_MOTION_PROFILE } from '@/lib/ergo-engine';
 import { exportSessionPdf } from '@/lib/pdf-export';
 import { loadVideo } from '@/lib/video-store';
-import type { BodyAngles } from '@/lib/ergo-engine';
+import type { BodyAngles, MotionProfile, MotionProfileKey } from '@/lib/ergo-engine';
 import { toast } from 'sonner';
 import type {
   CorrectiveAction, ActionStatus, ActionPriority, SessionRecord, RiskLevel,
@@ -103,7 +103,7 @@ const SCORE_EXPLAINERS = {
   },
 } as const;
 
-const ANGLE_SAFE_RANGES: Record<string, { safe: [number, number]; label: string }> = {
+const BASE_ANGLE_SAFE_RANGES: Record<string, { safe: [number, number]; label: string }> = {
   neckFlexion:   { safe: [-20, 20],  label: 'Neck Flexion' },
   trunkFlexion:  { safe: [-20, 20],  label: 'Trunk Flexion' },
   leftUpperArm:  { safe: [0, 20],    label: 'L. Shoulder Elevation' },
@@ -111,12 +111,24 @@ const ANGLE_SAFE_RANGES: Record<string, { safe: [number, number]; label: string 
   leftWrist:     { safe: [-15, 15],  label: 'L. Wrist Deviation' },
   rightWrist:    { safe: [-15, 15],  label: 'R. Wrist Deviation' },
   hipFlexion:    { safe: [-30, 30],  label: 'Hip Flexion' },
-  leftKnee:      { safe: [0, 30],    label: 'L. Knee Bend' },
-  rightKnee:     { safe: [0, 30],    label: 'R. Knee Bend' },
+  // Knee safe ranges are OVERRIDDEN per motion profile — see getAngleSafeRanges()
+  leftKnee:      { safe: [110, 155], label: 'L. Knee Bend' },
+  rightKnee:     { safe: [110, 155], label: 'R. Knee Bend' },
 };
 
-function getAngleRisk(key: string, value: number): 'safe' | 'caution' | 'danger' {
-  const r = ANGLE_SAFE_RANGES[key];
+/** Returns ANGLE_SAFE_RANGES with knee limits overridden by the session's motion profile */
+function getAngleSafeRanges(profile?: MotionProfile): Record<string, { safe: [number, number]; label: string }> {
+  if (!profile) return BASE_ANGLE_SAFE_RANGES;
+  return {
+    ...BASE_ANGLE_SAFE_RANGES,
+    leftKnee:  { safe: [profile.kneeSafeMin, profile.kneeSafeMax], label: 'L. Knee Bend' },
+    rightKnee: { safe: [profile.kneeSafeMin, profile.kneeSafeMax], label: 'R. Knee Bend' },
+  };
+}
+
+function getAngleRisk(key: string, value: number, profile?: MotionProfile): 'safe' | 'caution' | 'danger' {
+  const ranges = getAngleSafeRanges(profile);
+  const r = ranges[key];
   if (!r) return 'safe';
   const [lo, hi] = r.safe;
   const margin = (hi - lo) * 0.5;
@@ -788,10 +800,11 @@ function ActionRow({ action, onStatusChange }: { action: CorrectiveAction; onSta
 }
 
 // ─── Angle row helper ────────────────────────────────────────────────────────────────────────────────
-function AngleRow({ angleKey, value, lowConf }: { angleKey: string; value: number; lowConf?: boolean }) {
-  const info = ANGLE_SAFE_RANGES[angleKey];
+function AngleRow({ angleKey, value, lowConf, motionProfile }: { angleKey: string; value: number; lowConf?: boolean; motionProfile?: MotionProfile }) {
+  const ranges = getAngleSafeRanges(motionProfile);
+  const info = ranges[angleKey];
   if (!info) return null;
-  const risk = lowConf ? 'safe' : getAngleRisk(angleKey, value);
+  const risk = lowConf ? 'safe' : getAngleRisk(angleKey, value, motionProfile);
   const color = lowConf ? '#94a3b8' : angleColor(risk);
   const [lo, hi] = info.safe;
   const maxRange = Math.max(Math.abs(lo), Math.abs(hi)) * 2.5;
@@ -829,7 +842,7 @@ function AngleRow({ angleKey, value, lowConf }: { angleKey: string; value: numbe
  *   2. Clip Average Angles (secondary, non-authoritative, collapsible) — from session.avgAngles
  *      Provided for context only. Labeled explicitly as non-authoritative.
  */
-function AngleSection({ session }: { session: SessionRecord }) {
+function AngleSection({ session, motionProfile }: { session: SessionRecord; motionProfile?: MotionProfile }) {
   const [avgExpanded, setAvgExpanded] = useState(false);
   const hasPeak = session.peakAngles && Object.keys(session.peakAngles).length > 0;
   const hasAvg  = session.avgAngles  && Object.keys(session.avgAngles).length  > 0;
@@ -855,7 +868,7 @@ function AngleSection({ session }: { session: SessionRecord }) {
         {hasPeak && (
           <div className="space-y-3">
             {Object.entries(session.peakAngles!).map(([key, value]) => (
-              <AngleRow key={key} angleKey={key} value={value} />
+              <AngleRow key={key} angleKey={key} value={value} motionProfile={motionProfile} />
             ))}
           </div>
         )}
@@ -975,6 +988,12 @@ export default function SessionReport() {
   const openActions = actions.filter(a => a.status === 'open' || a.status === 'in-progress');
   const doneActions = actions.filter(a => a.status === 'completed' || a.status === 'verified');
 
+  // Motion profile — used for profile-aware knee safe ranges and tracking quality thresholds
+  const motionProfile: MotionProfile = (() => {
+    const key = (session as any).motionProfileKey as MotionProfileKey | undefined;
+    return key ? (MOTION_PROFILES[key] ?? MOTION_PROFILES[DEFAULT_MOTION_PROFILE]) : MOTION_PROFILES[DEFAULT_MOTION_PROFILE];
+  })();
+
   // Score risk levels — use PEAK integer scores for RULA/REBA (methodologically correct for ordinal scales)
   const peakRula = session.peakRula ?? Math.round(session.avgRula);
   const peakReba = session.peakReba ?? Math.round(session.avgReba);
@@ -1025,12 +1044,18 @@ export default function SessionReport() {
         <p className="text-sm text-muted-foreground">{session.taskName} · {session.id} · {session.date}</p>
       </div>
 
-      {/* Tracking Quality Badge */}
+      {/* Tracking Quality Badge — uses persisted session.trackingQuality (profile-aware thresholds) */}
       {(() => {
         const total = session.snapshots.length;
         const clamped = session.clampedFrames ?? 0;
         const pct = total > 0 ? Math.round((clamped / total) * 100) : 0;
-        const quality = pct === 0 ? 'excellent' : pct < 10 ? 'good' : pct < 25 ? 'fair' : 'poor';
+        // Use the persisted quality label (computed with profile-aware thresholds at analysis time).
+        // Fall back to a simple fixed cutoff for sessions recorded before this feature was added.
+        const persistedQuality = (session as any).trackingQuality as 'good' | 'fair' | 'poor' | undefined;
+        const fallbackQuality = pct === 0 ? 'good' : pct < 25 ? 'fair' : 'poor';
+        const rawQuality = persistedQuality ?? fallbackQuality;
+        // Map to display label (add 'excellent' tier for 0 clamped frames)
+        const quality = (clamped === 0 ? 'excellent' : rawQuality) as 'excellent' | 'good' | 'fair' | 'poor';
         const qColors = {
           excellent: 'bg-green-50 border-green-200 text-green-800',
           good:      'bg-green-50 border-green-200 text-green-800',
@@ -1180,7 +1205,7 @@ export default function SessionReport() {
       )}
 
       {/* FIX 3: Joint Angles — Peak-Posture Frame (primary, authoritative) + Clip Average (secondary, non-authoritative) */}
-      <AngleSection session={session} />
+       <AngleSection session={session} motionProfile={motionProfile} />
 
       {/* Risk Score Timeline */}
       {chartData.length > 1 && (

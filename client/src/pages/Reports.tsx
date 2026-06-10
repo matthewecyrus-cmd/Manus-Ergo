@@ -13,7 +13,7 @@
  * 7. Executive Summary
  */
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useCallback } from 'react';
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Cell, ReferenceLine, Legend,
@@ -29,6 +29,7 @@ import type { SessionRecord, RiskLevel, CorrectiveAction } from '@/lib/ergo-engi
 import {
   FileText, TrendingUp, BarChart2, List, Clock, Shield, Briefcase,
   Printer, ChevronDown, ChevronUp, AlertTriangle, CheckCircle2, Circle,
+  Download, GitCompare,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -879,6 +880,34 @@ export default function Reports() {
   const { sessions } = useSession();
   const [activeTab, setActiveTab] = useState<TabId>('individual');
   const [useMockData, setUseMockData] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showSelector, setShowSelector] = useState(false);
+  const [exportingComparison, setExportingComparison] = useState(false);
+
+  const toggleSession = useCallback((id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleComparisonExport = useCallback(async () => {
+    const src = useMockData ? MOCK_SESSIONS_MULTI : sessions;
+    const toExport = selectedIds.size > 0
+      ? src.filter(s => selectedIds.has(s.id))
+      : src.slice(0, Math.min(src.length, 6));
+    if (toExport.length === 0) return;
+    setExportingComparison(true);
+    try {
+      const { exportComparisonPdf } = await import('@/lib/pdf-comparison');
+      await exportComparisonPdf(toExport);
+    } catch (e) {
+      console.error('[ErgoKit] Comparison PDF failed:', e);
+    } finally {
+      setExportingComparison(false);
+    }
+  }, [selectedIds, sessions, useMockData]);
 
   const effectiveSessions = useMemo(() => {
     const src = useMockData ? MOCK_SESSIONS_MULTI : sessions;
@@ -909,6 +938,23 @@ export default function Reports() {
             </button>
           )}
           <button
+            onClick={() => setShowSelector(v => !v)}
+            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold border transition-colors"
+            style={{ borderColor: BRAND.teal, color: showSelector ? BRAND.teal : BRAND.navy, fontFamily: BRAND.font }}
+          >
+            <GitCompare className="w-4 h-4" />
+            {selectedIds.size > 0 ? `${selectedIds.size} selected` : 'Compare'}
+          </button>
+          <button
+            onClick={handleComparisonExport}
+            disabled={exportingComparison}
+            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold border transition-colors disabled:opacity-50"
+            style={{ borderColor: BRAND.coral, color: BRAND.coral, fontFamily: BRAND.font }}
+          >
+            <Download className="w-4 h-4" />
+            {exportingComparison ? 'Generating…' : 'Comparison PDF'}
+          </button>
+          <button
             onClick={() => window.print()}
             className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-white hover:opacity-90 transition-opacity"
             style={{ background: BRAND.navy, fontFamily: BRAND.font }}
@@ -918,6 +964,50 @@ export default function Reports() {
           </button>
         </div>
       </div>
+
+      {/* Session selector panel for comparison export */}
+      {showSelector && (
+        <div className="border-b bg-slate-50 px-6 py-3" style={{ borderColor: BRAND.gray }}>
+          <p className="text-xs font-semibold mb-2" style={{ color: BRAND.navy, fontFamily: BRAND.font }}>
+            Select sessions to include in the Comparison PDF (leave all unchecked to include all):
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {effectiveSessions.map((s, idx) => {
+              const checked = selectedIds.has(s.id);
+              return (
+                <button
+                  key={s.id}
+                  onClick={() => toggleSession(s.id)}
+                  className={cn(
+                    'flex items-center gap-1.5 px-2.5 py-1 rounded border text-xs font-medium transition-colors',
+                    checked ? 'text-white' : 'bg-white text-gray-600 hover:border-gray-400',
+                  )}
+                  style={{
+                    borderColor: checked ? BRAND.teal : BRAND.gray,
+                    background: checked ? BRAND.teal : undefined,
+                    fontFamily: BRAND.font,
+                  }}
+                >
+                  <span className={cn('w-3 h-3 rounded-sm border flex items-center justify-center shrink-0', checked ? 'border-white' : 'border-gray-400')}>
+                    {checked && <span className="block w-1.5 h-1.5 bg-white rounded-sm" />}
+                  </span>
+                  S{idx + 1}: {s.taskName.length > 22 ? s.taskName.slice(0, 20) + '…' : s.taskName}
+                  <span className="opacity-60">({s.date.slice(0, 10)})</span>
+                </button>
+              );
+            })}
+          </div>
+          {selectedIds.size > 0 && (
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="mt-2 text-xs underline"
+              style={{ color: BRAND.coral, fontFamily: BRAND.font }}
+            >
+              Clear selection
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Tab bar */}
       <div className="border-b bg-white px-6 overflow-x-auto" style={{ borderColor: BRAND.gray }}>

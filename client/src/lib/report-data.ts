@@ -170,6 +170,8 @@ export const MOCK_SESSION_BASELINE: SessionRecord = {
   clampedFrames: 0,
   sustainedPeakRula: 7,
   sustainedPeakReba: 9,
+  motionProfileKey: 'standing-carry',
+  trackingQuality: 'good',
 };
 
 export const MOCK_SESSION_FOLLOWUP: SessionRecord = {
@@ -220,6 +222,8 @@ export const MOCK_SESSION_FOLLOWUP: SessionRecord = {
   clampedFrames: 0,
   sustainedPeakRula: 4,
   sustainedPeakReba: 4,
+  motionProfileKey: 'standing-carry',
+  trackingQuality: 'good',
 };
 
 // Multiple sessions for job profile / trend / rollup reports
@@ -255,6 +259,8 @@ export const MOCK_SESSIONS_MULTI: SessionRecord[] = [
     clampedFrames: 0,
     sustainedPeakRula: 6,
     sustainedPeakReba: 7,
+    motionProfileKey: 'sedentary' as const,
+    trackingQuality: 'good' as const,
   },
   {
     id: 'ERG-MOCK-004',
@@ -285,6 +291,8 @@ export const MOCK_SESSIONS_MULTI: SessionRecord[] = [
     clampedFrames: 0,
     sustainedPeakRula: 6,
     sustainedPeakReba: 11,
+    motionProfileKey: 'squat-lift' as const,
+    trackingQuality: 'good' as const,
   },
   {
     id: 'ERG-MOCK-005',
@@ -315,6 +323,8 @@ export const MOCK_SESSIONS_MULTI: SessionRecord[] = [
     clampedFrames: 0,
     sustainedPeakRula: 3,
     sustainedPeakReba: 3,
+    motionProfileKey: 'sedentary' as const,
+    trackingQuality: 'good' as const,
   },
   {
     id: 'ERG-MOCK-006',
@@ -345,6 +355,8 @@ export const MOCK_SESSIONS_MULTI: SessionRecord[] = [
     clampedFrames: 0,
     sustainedPeakRula: 7,
     sustainedPeakReba: 12,
+    motionProfileKey: 'dynamic' as const,
+    trackingQuality: 'good' as const,
   },
 ];
 

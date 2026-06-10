@@ -48,8 +48,8 @@ import { Slider } from '@/components/ui/slider';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from 'sonner';
 import { useSession, SessionContext } from '@/contexts/SessionContext';
-import { EMAFilter, computeSnapshot, riskLabel, summarizeSession, extractAngles, resetAngleState } from '@/lib/ergo-engine';
-import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord, BodyAngles } from '@/lib/ergo-engine';
+import { EMAFilter, computeSnapshot, riskLabel, summarizeSession, extractAngles, resetAngleState, MOTION_PROFILES, inferMotionProfile } from '@/lib/ergo-engine';
+import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord, BodyAngles, MotionProfileKey } from '@/lib/ergo-engine';
 import { saveVideo } from '@/lib/video-store';
 
 const MEDIAPIPE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
@@ -232,6 +232,9 @@ export default function VideoUpload() {
   const [baselineId, setBaselineId] = useState('');
   const [configOpen, setConfigOpen] = useState(true);
   const [videoAspect, setVideoAspect] = useState<string>('16 / 9');
+  const [motionProfileKey, setMotionProfileKey] = useState<MotionProfileKey>(() => inferMotionProfile(taskProfile.taskName));
+  const motionProfileKeyRef = useRef<MotionProfileKey>(motionProfileKey);
+  useEffect(() => { motionProfileKeyRef.current = motionProfileKey; }, [motionProfileKey]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -370,6 +373,7 @@ export default function VideoUpload() {
         location: workLocation || undefined,
         notes: notes || undefined,
         thumbnailDataUrl: thumbnailDataUrlRef.current,
+        motionProfileKey: motionProfileKeyRef.current,
       },
     );
     if (baselineId) (record as any).baselineSessionId = baselineId;
@@ -540,7 +544,7 @@ export default function VideoUpload() {
       if (!lm) return;
       lastReportTimeRef.current = Date.now();
 
-      const snap = computeSnapshot(lm, taskProfileRef.current);
+      const snap = computeSnapshot(lm, taskProfileRef.current, MOTION_PROFILES[motionProfileKeyRef.current]);
       if (snap) {
         snapshotsRef.current.push({ ...snap, timestamp: video.currentTime * 1000, landmarks: lm });
         // Use startTransition so React batches these low-priority UI updates
@@ -835,6 +839,24 @@ export default function VideoUpload() {
                   <Label className="text-xs">Repetitions/min: <span className="font-semibold">{taskProfile.repRate}</span></Label>
                   <Slider value={[taskProfile.repRate]} onValueChange={([v]) => updateProfile({ repRate: v })}
                     min={1} max={60} step={1} className="py-1" />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Motion Profile</Label>
+                  <Select value={motionProfileKey} onValueChange={v => {
+                    const k = v as MotionProfileKey;
+                    setMotionProfileKey(k);
+                    motionProfileKeyRef.current = k;
+                  }}>
+                    <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {(Object.values(MOTION_PROFILES)).map(p => (
+                        <SelectItem key={p.key} value={p.key}>
+                          <span className="font-medium">{p.label}</span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[10px] text-muted-foreground">{MOTION_PROFILES[motionProfileKey].description}</p>
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1.5">

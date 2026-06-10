@@ -131,6 +131,113 @@ export const DEFAULT_TASK_PROFILE: TaskProfile = {
 // ─── CONFIDENCE THRESHOLD ────────────────────────────────────────────
 export const VISIBILITY_THRESHOLD = 0.65;
 
+// ─── MOTION PROFILE SYSTEM ───────────────────────────────────────────────────
+/**
+ * A MotionProfile describes the expected range of motion for a task category.
+ * It overrides per-joint anatomical limits where the task-specific safe range
+ * differs from the absolute physiological maximum, and sets the tracking-quality
+ * thresholds appropriate for the expected motion complexity.
+ *
+ * Profiles:
+ *   'standing-carry'  — worker is upright, carrying/handling objects at waist-
+ *                       to-shoulder height. Deep knee flexion is NOT expected;
+ *                       the relevant knee risk is hyperextension (>160°) which
+ *                       indicates a lunge or stumble. Flags deep flexion (<100°).
+ *   'squat-lift'      — worker performs repetitive squat-to-stand lifts. Deep
+ *                       knee flexion (down to 90°) is expected and normal;
+ *                       hyperextension (>165°) is the artifact to flag.
+ *   'dynamic'         — high-speed, whole-body tasks (sport, manual handling
+ *                       with rotation, overhead work). Wide knee ROM expected;
+ *                       only extreme values (<30° or >170°) are artifacts.
+ *                       Tracking quality thresholds are relaxed because fast
+ *                       motion inherently causes more landmark jitter.
+ *   'sedentary'       — seated or near-stationary assembly. Knees are near
+ *                       90° flexion; values outside 60–130° are artifacts.
+ *                       Tracking quality thresholds are strict.
+ */
+export type MotionProfileKey = 'standing-carry' | 'squat-lift' | 'dynamic' | 'sedentary';
+
+export interface MotionProfile {
+  key: MotionProfileKey;
+  label: string;
+  description: string;
+  /** Override knee limits (min/max degrees, 0=full extension, 180=full flexion) */
+  kneeMin: number;
+  kneeMax: number;
+  /** Knee safe display range for the report (values outside this are highlighted red) */
+  kneeSafeMin: number;
+  kneeSafeMax: number;
+  /** Tracking quality thresholds: fraction of clamped frames */
+  trackingGood: number;  // below this → Good
+  trackingFair: number;  // below this → Fair (above → Poor)
+}
+
+export const MOTION_PROFILES: Record<MotionProfileKey, MotionProfile> = {
+  'standing-carry': {
+    key: 'standing-carry',
+    label: 'Standing / Carry',
+    description: 'Upright work, carrying or handling objects at waist-to-shoulder height.',
+    // Standing workers flex knees ~10–30° normally; deep flexion (<100°) is a lunge artifact
+    // or genuine risk; hyperextension (>160°) is a stumble artifact.
+    kneeMin: 100,
+    kneeMax: 160,
+    kneeSafeMin: 110,
+    kneeSafeMax: 155,
+    trackingGood: 0.20,
+    trackingFair: 0.40,
+  },
+  'squat-lift': {
+    key: 'squat-lift',
+    label: 'Squat / Lift',
+    description: 'Repetitive squat-to-stand lifts; deep knee flexion is expected.',
+    // Deep squat reaches ~90° flexion (angle=90°); hyperextension >165° is artifact.
+    kneeMin: 60,
+    kneeMax: 165,
+    kneeSafeMin: 70,
+    kneeSafeMax: 160,
+    trackingGood: 0.25,
+    trackingFair: 0.50,
+  },
+  'dynamic': {
+    key: 'dynamic',
+    label: 'Dynamic / Sport',
+    description: 'High-speed whole-body tasks: throwing, overhead work, manual handling with rotation.',
+    // Very wide ROM expected; only extreme values are artifacts.
+    kneeMin: 30,
+    kneeMax: 170,
+    kneeSafeMin: 40,
+    kneeSafeMax: 165,
+    trackingGood: 0.40,
+    trackingFair: 0.65,
+  },
+  'sedentary': {
+    key: 'sedentary',
+    label: 'Sedentary / Assembly',
+    description: 'Seated or near-stationary work; knees near 90° throughout.',
+    // Seated: knees ~80–100°; values outside 60–130° are artifacts.
+    kneeMin: 60,
+    kneeMax: 130,
+    kneeSafeMin: 70,
+    kneeSafeMax: 120,
+    trackingGood: 0.15,
+    trackingFair: 0.35,
+  },
+};
+
+export const DEFAULT_MOTION_PROFILE: MotionProfileKey = 'standing-carry';
+
+/**
+ * Infer a sensible default motion profile from the task name string.
+ * Used when the user has not explicitly chosen a profile.
+ */
+export function inferMotionProfile(taskName: string): MotionProfileKey {
+  const lower = taskName.toLowerCase();
+  if (/squat|lift|floor|crouch|kneel/.test(lower)) return 'squat-lift';
+  if (/throw|bowl|sport|swing|overhead|dynamic|run|jump|carry.*throw|throw.*carry/.test(lower)) return 'dynamic';
+  if (/sit|seat|desk|assembly|bench|station/.test(lower)) return 'sedentary';
+  return 'standing-carry';
+}
+
 // ─── ANATOMICAL PLAUSIBILITY GUARD (ITEM 4) ───────────────────────────────────
 /**
  * Per-joint absolute range limits (degrees).
@@ -182,7 +289,7 @@ export const ANATOMICAL_LIMITS: Record<keyof BodyAngles, { min: number; max: num
  * for other joints. The implausibleJoints list lets scoring functions apply
  * conservative fallbacks for only the affected joints.
  */
-export function validateAngles(raw: BodyAngles): {
+export function validateAngles(raw: BodyAngles, profile?: MotionProfile): {
   angles: BodyAngles;
   implausibleJoints: string[];
   lowConfidence: boolean;
@@ -191,7 +298,15 @@ export function validateAngles(raw: BodyAngles): {
   const implausibleJoints: string[] = [];
 
   for (const key of Object.keys(ANATOMICAL_LIMITS) as (keyof BodyAngles)[]) {
-    const { min, max } = ANATOMICAL_LIMITS[key];
+    // Use profile-specific knee limits when a profile is provided
+    let min: number;
+    let max: number;
+    if (profile && (key === 'leftKnee' || key === 'rightKnee')) {
+      min = profile.kneeMin;
+      max = profile.kneeMax;
+    } else {
+      ({ min, max } = ANATOMICAL_LIMITS[key]);
+    }
     const v = angles[key];
     if (v < min || v > max) {
       implausibleJoints.push(key);
@@ -948,6 +1063,7 @@ export function aggregateRisk(scores: ScoreResult[]): { overallRisk: RiskLevel; 
 export function computeSnapshot(
   smoothedLandmarks: Landmarks,
   task: TaskProfile,
+  motionProfile?: MotionProfile,
 ): ErgoSnapshot | null {
   const { angles: rawAngles, avgConfidence } = extractAngles(smoothedLandmarks);
   if (avgConfidence < 0.3) return null; // not enough body visible
@@ -958,7 +1074,9 @@ export function computeSnapshot(
   // inflating RULA/REBA scores. Implausible joints are logged; if any are found
   // the frame is treated as low-confidence (confidence capped at 0.5) so the
   // outlier filter in summarizeSession is more likely to exclude it.
-  const { angles, implausibleJoints, lowConfidence } = validateAngles(rawAngles);
+  // When a motionProfile is provided, knee limits are overridden to match the
+  // expected ROM for the task category (e.g. standing-carry vs squat-lift).
+  const { angles, implausibleJoints, lowConfidence } = validateAngles(rawAngles, motionProfile);
   const effectiveConfidence = lowConfidence
     ? Math.min(avgConfidence, LOW_CONFIDENCE_FRAME_THRESHOLD)
     : avgConfidence;
@@ -1106,6 +1224,16 @@ export interface SessionRecord {
    * frames. Same rationale as sustainedPeakRula.
    */
   sustainedPeakReba: number;
+  /**
+   * Motion profile key used for this session's plausibility guard and tracking
+   * quality thresholds. Persisted so the PDF badge is always reproducible.
+   */
+  motionProfileKey: MotionProfileKey;
+  /**
+   * Computed tracking quality label using the profile-specific thresholds.
+   * 'good' | 'fair' | 'poor' — persisted so the PDF badge is always reproducible.
+   */
+  trackingQuality: 'good' | 'fair' | 'poor';
 }
 
 // ─── BODY REGION RISK BUILDER ────────────────────────────────────────────────
@@ -1225,7 +1353,7 @@ export function summarizeSession(
   task: TaskProfile,
   durationSec: number,
   source: SessionSource = 'camera',
-  meta?: { assessor?: string; department?: string; location?: string; notes?: string; thumbnailDataUrl?: string },
+  meta?: { assessor?: string; department?: string; location?: string; notes?: string; thumbnailDataUrl?: string; motionProfileKey?: MotionProfileKey },
 ): SessionRecord {
   // Outlier filtering: remove snapshots where REBA is a statistical outlier
   // (>2.5 std deviations from median) — these are tracking artifact frames from fast motion
@@ -1272,6 +1400,18 @@ export function summarizeSession(
     s => s.rula.confidence <= LOW_CONFIDENCE_FRAME_THRESHOLD ||
          s.reba.confidence <= LOW_CONFIDENCE_FRAME_THRESHOLD
   ).length;
+
+  // ── Resolve motion profile and tracking quality thresholds ───────────────
+  const motionProfileKey: MotionProfileKey = meta?.motionProfileKey
+    ?? inferMotionProfile(task.taskName);
+  const resolvedProfile = MOTION_PROFILES[motionProfileKey];
+  const clampRatio = filteredSnapshots.length > 0
+    ? clampedFrames / filteredSnapshots.length
+    : 0;
+  const trackingQuality: 'good' | 'fair' | 'poor' =
+    clampRatio < resolvedProfile.trackingGood ? 'good'
+    : clampRatio < resolvedProfile.trackingFair ? 'fair'
+    : 'poor';
 
   // ── Sustained peak scores (≥3 consecutive frames at that level) ──────────
   // Sliding-window: find the highest score that appears in any run of ≥3
@@ -1346,5 +1486,7 @@ export function summarizeSession(
     clampedFrames,
     sustainedPeakRula,
     sustainedPeakReba,
+    motionProfileKey,
+    trackingQuality,
   };
 }
