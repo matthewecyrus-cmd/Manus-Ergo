@@ -52,7 +52,51 @@ function normalizeRisk(level: string): RiskLevel {
   return 'low';
 }
 
-// ─── PDF builder ───────────────────────────────────────────────────────────────
+// ─── PDF text sanitizer ─────────────────────────────────────────────────────
+/**
+ * jsPDF's built-in Helvetica/Courier/Times fonts only cover the Latin-1 (ISO 8859-1)
+ * code page. Any character outside that range (e.g. U+00B0 DEGREE SIGN, U+2265 GREATER
+ * THAN OR EQUAL TO, U+2019 RIGHT SINGLE QUOTATION MARK) is silently dropped, producing
+ * invisible gaps or corrupt text in the PDF.
+ *
+ * This function replaces the most common offenders with safe ASCII equivalents so the
+ * rendered text is always readable without requiring a custom font embed.
+ */
+export function sanitizePdfText(text: string): string {
+  return text
+    // Degree sign (U+00B0) — present in all recommendation strings
+    .replace(/\u00b0/g, ' deg')
+    // Greater-than-or-equal (U+2265) — used in sustained-peak disclaimer
+    .replace(/\u2265/g, '>=')
+    // Less-than-or-equal (U+2264)
+    .replace(/\u2264/g, '<=')
+    // En dash (U+2013) and em dash (U+2014)
+    .replace(/\u2013/g, '-')
+    .replace(/\u2014/g, '--')
+    // Curly quotes (U+2018, U+2019, U+201C, U+201D)
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
+    // Bullet (U+2022) — sometimes used in description text
+    .replace(/\u2022/g, '-')
+    // Multiplication sign (U+00D7)
+    .replace(/\u00d7/g, 'x')
+    // Plus-minus (U+00B1)
+    .replace(/\u00b1/g, '+/-')
+    // HTML entity fallback (in case any raw entities leaked through)
+    .replace(/&deg;/g, ' deg')
+    .replace(/&ge;/g, '>=')
+    .replace(/&le;/g, '<=')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    // Strip any remaining non-Latin-1 characters (U+0100 and above) to prevent
+    // silent drops; replace with '?' so the gap is visible during QA.
+    .replace(/[\u0100-\uFFFF]/g, '?');
+}
+
+// ─── PDF builder ─────────────────────────────────────────────────────
 export async function exportSessionPdf(session: SessionRecord): Promise<void> {
   // Dynamic import to avoid loading jspdf at startup
   const { jsPDF } = await import('jspdf');
@@ -112,7 +156,7 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
   // Title
   setFont(18, 'bold');
   setColor(15, 23, 42);
-  doc.text(session.taskName || 'Ergonomics Assessment', MARGIN, y);
+  doc.text(sanitizePdfText(session.taskName || 'Ergonomics Assessment'), MARGIN, y);
   y += 7;
 
   // Metadata row
@@ -127,7 +171,7 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
   if (session.assessor) meta.push(`Assessor: ${session.assessor}`);
   if (session.department) meta.push(`Dept: ${session.department}`);
   if (session.location) meta.push(`Location: ${session.location}`);
-  doc.text(meta.join('   ·   '), MARGIN, y);
+  doc.text(sanitizePdfText(meta.join('   ·   ')), MARGIN, y);
   y += 8;
 
   // Risk badge
@@ -181,7 +225,7 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
 
   setFont(9);
   setColor(51, 65, 85);
-  const summaryLines = doc.splitTextToSize(summaryText, CONTENT_W);
+  const summaryLines = doc.splitTextToSize(sanitizePdfText(summaryText), CONTENT_W);
   doc.text(summaryLines, MARGIN, y);
   y += summaryLines.length * 5 + 8;
 
@@ -285,8 +329,7 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
         const [susr, susg, susb] = riskRgb(sustainedRisk);
         setFont(6);
         setColor(100, 116, 139);
-        doc.text('Sustained (≥3 frames):', cx + 7, y + 30);
-        setFont(7, 'bold');
+     doc.text('Sustained (>=3 frames):', cx + 7, y + 30);       setFont(7, 'bold');
         setColor(susr, susg, susb);
         doc.text(String(s.sustained), cx + 46, y + 30);
         if (s.sustained < s.score) {
@@ -406,11 +449,11 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
 
       setFont(8, 'bold');
       setColor(ar, ag, ab);
-      doc.text(`${value.toFixed(1)}°`, MARGIN + 60 + barMaxW2 + 3, y + 5.5);
+      doc.text(`${value.toFixed(1)} deg`, MARGIN + 60 + barMaxW2 + 3, y + 5.5);
 
       setFont(6);
       setColor(148, 163, 184);
-      doc.text(`Safe: 0° to ${hi}°`, MARGIN + 60, y + 9);
+      doc.text(`Safe: 0 to ${hi} deg`, MARGIN + 60, y + 9);
 
       y += 11;
     }
@@ -434,7 +477,7 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
   if (recommendations.length > 0) {
     for (let i = 0; i < recommendations.length; i++) {
       const rec = recommendations[i];
-      const lines = doc.splitTextToSize(rec, CONTENT_W - 12);
+      const lines = doc.splitTextToSize(sanitizePdfText(rec), CONTENT_W - 12);
       const blockH = lines.length * 5 + 6;
       checkPage(blockH + 2);
 
@@ -473,7 +516,7 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
     y += 7;
 
     for (const action of actions) {
-      const lines = doc.splitTextToSize(action.description, CONTENT_W - 50);
+      const lines = doc.splitTextToSize(sanitizePdfText(action.description), CONTENT_W - 50);
       const blockH = Math.max(12, lines.length * 5 + 6);
       checkPage(blockH + 2);
 
@@ -545,8 +588,8 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
     y += 7;
     setFont(8);
     setColor(51, 65, 85);
-    const noteLines = doc.splitTextToSize(session.notes, CONTENT_W);
-    doc.text(noteLines, MARGIN, y);
+  const noteLines = doc.splitTextToSize(sanitizePdfText(session.notes), CONTENT_W);
+  doc.text(noteLines, MARGIN, y);
     y += noteLines.length * 5 + 4;
   }
 
@@ -554,11 +597,11 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
   checkPage(12);
   setFont(7);
   setColor(148, 163, 184);
-  const disclaimer = 'This report is generated automatically by computer vision analysis. Results should be reviewed by a qualified ergonomist for critical decisions. Sustained peak scores represent the highest risk level maintained for ≥3 consecutive frames; absolute peak scores represent the single worst frame.';
+  const disclaimer = 'This report is generated automatically by computer vision analysis. Results should be reviewed by a qualified ergonomist for critical decisions. Sustained peak scores represent the highest risk level maintained for >=3 consecutive frames; absolute peak scores represent the single worst frame.';
   const disclaimerLines = doc.splitTextToSize(disclaimer, CONTENT_W);
   doc.text(disclaimerLines, MARGIN, y);
 
-  // ─── Save ─────────────────────────────────────────────────────────────────────
+  // ─── Save ─────────────────────────────────────────────────────────────────────────────
   const filename = `ergokit-${session.id}-${session.taskName.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.pdf`;
   doc.save(filename);
 }

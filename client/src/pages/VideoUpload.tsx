@@ -37,7 +37,7 @@ import { useLocation } from 'wouter';
 import {
   Upload, Film, Play, CheckCircle2, AlertCircle,
   Settings2, ChevronRight, X, FileVideo, ChevronDown, ChevronUp,
-  Pause, Square, StopCircle
+  Pause, Square, StopCircle, ShieldAlert, Eye, Ruler, User
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -151,6 +151,14 @@ const JOINT_SEG: Record<number, Seg> = {
 // We detect this by comparing the displayed aspect ratio to the raw aspect ratio:
 //   - If they differ significantly AND the inverse matches, the video is rotated.
 //   - In that case we swap effW/effH so the letterbox math uses the displayed geometry.
+
+/**
+ * Minimum number of landmarks (out of 33) that must be above the CONF threshold
+ * for the skeleton to be drawn. Below this count the pose is too sparse / unreliable
+ * and rendering a partial skeleton would be misleading.
+ */
+const MIN_VISIBLE_LANDMARKS = 15;
+
 function drawSkeleton(
   ctx: CanvasRenderingContext2D,
   W: number, H: number,
@@ -177,6 +185,11 @@ function drawSkeleton(
   const px = (nx: number) => drawX + nx * drawW;
   const py = (ny: number) => drawY + ny * drawH;
   const CONF = 0.25;
+
+  // Suppress skeleton entirely when fewer than MIN_VISIBLE_LANDMARKS landmarks
+  // are above the confidence threshold — a sparse skeleton is misleading.
+  const visibleCount = landmarks.filter(lm => lm && (lm.visibility ?? 1) >= CONF).length;
+  if (visibleCount < MIN_VISIBLE_LANDMARKS) return;
 
   const lw = Math.min(2, Math.max(1.5, drawW / 400));
   const jr = Math.min(2.5, Math.max(2, drawW / 250));
@@ -235,6 +248,8 @@ export default function VideoUpload() {
   const [motionProfileKey, setMotionProfileKey] = useState<MotionProfileKey>(() => inferMotionProfile(taskProfile.taskName));
   const motionProfileKeyRef = useRef<MotionProfileKey>(motionProfileKey);
   useEffect(() => { motionProfileKeyRef.current = motionProfileKey; }, [motionProfileKey]);
+  // Capture protocol acknowledgement — resets when a new video is loaded
+  const [protocolAcknowledged, setProtocolAcknowledged] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -291,6 +306,7 @@ export default function VideoUpload() {
     setResultId(null);
     setErrorMsg(null);
     setLiveScores(null);
+    setProtocolAcknowledged(false); // require re-acknowledgement for each new video
   }, [videoUrl]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -795,9 +811,47 @@ export default function VideoUpload() {
 
         {/* Right: controls (2/5) */}
         <div className="lg:col-span-2 space-y-3">
+          {/* Capture protocol warning — shown when a video is loaded but not yet acknowledged */}
+          {videoFile && !protocolAcknowledged && !isAnalyzing && analysisState === 'idle' && (
+            <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="w-5 h-5 text-amber-600 flex-shrink-0" />
+                <p className="text-sm font-semibold text-amber-900">Capture Protocol Check</p>
+              </div>
+              <p className="text-xs text-amber-800 leading-relaxed">
+                For accurate ergonomic scoring, confirm your recording meets all four requirements:
+              </p>
+              <ul className="space-y-2">
+                <li className="flex items-start gap-2 text-xs text-amber-800">
+                  <User className="w-3.5 h-3.5 mt-0.5 text-amber-600 flex-shrink-0" />
+                  <span><strong>Full body visible</strong> — head, torso, arms, and legs must all be in frame throughout the task</span>
+                </li>
+                <li className="flex items-start gap-2 text-xs text-amber-800">
+                  <Eye className="w-3.5 h-3.5 mt-0.5 text-amber-600 flex-shrink-0" />
+                  <span><strong>Side profile angle</strong> — camera positioned at 90° to the worker’s sagittal plane for accurate trunk and limb angles</span>
+                </li>
+                <li className="flex items-start gap-2 text-xs text-amber-800">
+                  <Ruler className="w-3.5 h-3.5 mt-0.5 text-amber-600 flex-shrink-0" />
+                  <span><strong>6–8 feet minimum distance</strong> — worker should occupy at least 40% of frame height; closer clips cause keypoint dropout</span>
+                </li>
+                <li className="flex items-start gap-2 text-xs text-amber-800">
+                  <Film className="w-3.5 h-3.5 mt-0.5 text-amber-600 flex-shrink-0" />
+                  <span><strong>Good lighting, no motion blur</strong> — well-lit scene without heavy shadows; fast throws or swings may reduce tracking confidence</span>
+                </li>
+              </ul>
+              <Button
+                size="sm"
+                className="w-full bg-amber-600 hover:bg-amber-700 text-white text-xs h-8"
+                onClick={() => setProtocolAcknowledged(true)}
+              >
+                <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" />
+                Video meets these requirements — proceed
+              </Button>
+            </div>
+          )}
           <Button
-            className="w-full gap-2 bg-sky-600 hover:bg-sky-700 text-white h-12 text-base font-semibold shadow-md"
-            disabled={!videoFile || isAnalyzing}
+            className="w-full gap-2 bg-sky-600 hover:bg-sky-700 text-white h-12 text-base font-semibold shadow-md disabled:opacity-40"
+            disabled={!videoFile || isAnalyzing || (!!videoFile && !protocolAcknowledged && analysisState === 'idle')}
             onClick={analyzeVideo}
           >
             {isAnalyzing ? (

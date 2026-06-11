@@ -310,6 +310,12 @@ function drawSkeleton(
   const px = (lmx: number) => lb.x + lmx * lb.w;
   const py = (lmy: number) => lb.y + lmy * lb.h;
 
+  // Minimum visible landmark guard — suppress skeleton when too few landmarks are
+  // above the confidence threshold to avoid misleading partial skeletons.
+  const MIN_VISIBLE_LIVE = 15;
+  const visCountLive = lm.filter(l => l && (l.visibility ?? 0) >= VISIBILITY_THRESHOLD).length;
+  if (visCountLive < MIN_VISIBLE_LIVE) return;
+
   // Draw connections — thin, round caps, gradient between different risk colors
   ctx.lineCap = 'round';
   ctx.lineWidth = 1.5;
@@ -322,9 +328,17 @@ function drawSkeleton(
     if (cA === cB) {
       ctx.strokeStyle = cA;
     } else {
-      const grad = ctx.createLinearGradient(px(la.x), py(la.y), px(lb2.x), py(lb2.y));
-      grad.addColorStop(0, cA);
-      grad.addColorStop(1, cB);
+      // Always build the gradient top-to-bottom (min Y first) so that in a deep squat,
+      // where the knee Y is above the hip Y in screen space, the color stops are not
+      // inverted — the joint at the higher screen position gets its own color.
+      const paY = py(la.y), pbY = py(lb2.y);
+      const topIsA = paY <= pbY;
+      const [gx1, gy1, gc0, gx2, gy2, gc1] = topIsA
+        ? [px(la.x), paY, cA, px(lb2.x), pbY, cB]
+        : [px(lb2.x), pbY, cB, px(la.x), paY, cA];
+      const grad = ctx.createLinearGradient(gx1, gy1, gx2, gy2);
+      grad.addColorStop(0, gc0);
+      grad.addColorStop(1, gc1);
       ctx.strokeStyle = grad;
     }
     ctx.beginPath();

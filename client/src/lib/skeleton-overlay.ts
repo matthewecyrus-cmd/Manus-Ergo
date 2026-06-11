@@ -197,15 +197,28 @@ export function drawSkeleton({
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
+  // Minimum visible landmark guard — suppress skeleton when too few landmarks are
+  // above the confidence threshold to avoid misleading partial skeletons.
+  const MIN_VISIBLE = 15;
+  const visCount = landmarks.filter(lm => lm && (lm.visibility ?? 1) >= minVisibility).length;
+  if (visCount < MIN_VISIBLE) return;
+
   for (const [a, b] of BONES) {
     const pa = px(a), pb = px(b);
     if (!pa || !pb) continue;
     if (pa.v < minVisibility || pb.v < minVisibility) continue;
     const cA = jointColors[a] ?? C_NEUTRAL;
     const cB = jointColors[b] ?? C_NEUTRAL;
-    const grad = ctx.createLinearGradient(pa.x, pa.y, pb.x, pb.y);
-    grad.addColorStop(0, cA + "dd");
-    grad.addColorStop(1, cB + "dd");
+    // Always build the gradient top-to-bottom (min Y first) so that in a deep squat,
+    // where the knee Y is above the hip Y in screen space, the color stops are not
+    // inverted — the joint at the higher screen position gets its own color.
+    const topIsA = pa.y <= pb.y;
+    const [gx1, gy1, gc0, gx2, gy2, gc1] = topIsA
+      ? [pa.x, pa.y, cA, pb.x, pb.y, cB]
+      : [pb.x, pb.y, cB, pa.x, pa.y, cA];
+    const grad = ctx.createLinearGradient(gx1, gy1, gx2, gy2);
+    grad.addColorStop(0, gc0 + "dd");
+    grad.addColorStop(1, gc1 + "dd");
     ctx.shadowColor = "rgba(0,0,0,0.5)";
     ctx.shadowBlur  = 3;
     ctx.beginPath();

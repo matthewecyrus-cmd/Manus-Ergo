@@ -14,6 +14,7 @@
 import type { SessionRecord, RiskLevel, MotionProfileKey } from './ergo-engine';
 import { jsPDF } from 'jspdf';
 import { MOTION_PROFILES, DEFAULT_MOTION_PROFILE } from './ergo-engine';
+import { sanitizePdfText } from './pdf-export';
 
 // ─── Retroactive tracking quality classification ──────────────────────────────
 /**
@@ -149,7 +150,7 @@ export async function exportComparisonPdf(sessions: SessionRecord[]): Promise<vo
   const commonTask = sorted[0]?.taskName ?? 'Ergonomics Assessment';
   setFont(12);
   setColor(100, 116, 139);
-  doc.text(commonTask, MARGIN, y);
+  doc.text(sanitizePdfText(commonTask), MARGIN, y);
   y += 8;
 
   // Date range
@@ -157,7 +158,7 @@ export async function exportComparisonPdf(sessions: SessionRecord[]): Promise<vo
   const dateTo   = fmtDate(sorted[sorted.length - 1].date);
   setFont(9);
   setColor(100, 116, 139);
-  doc.text(`Date range: ${dateFrom} — ${dateTo}`, MARGIN, y);
+  doc.text(sanitizePdfText(`Date range: ${dateFrom} - ${dateTo}`), MARGIN, y);
   y += 5;
   doc.text(`Sessions included: ${sorted.length}`, MARGIN, y);
   y += 5;
@@ -165,7 +166,7 @@ export async function exportComparisonPdf(sessions: SessionRecord[]): Promise<vo
   // Assessors
   const assessors = Array.from(new Set(sorted.map(s => s.assessor).filter(Boolean))) as string[];
   if (assessors.length > 0) {
-    doc.text(`Assessor(s): ${assessors.join(', ')}`, MARGIN, y);
+    doc.text(sanitizePdfText(`Assessor(s): ${assessors.join(', ')}`), MARGIN, y);
     y += 5;
   }
 
@@ -252,7 +253,7 @@ export async function exportComparisonPdf(sessions: SessionRecord[]): Promise<vo
     const cleanTaskName = s.taskName.replace(/\s*\([^)]*\)\s*$/, '').trim();
     setFont(14, 'bold');
     setColor(27, 58, 107);
-    doc.text(`Session ${si + 1}: ${cleanTaskName} (${profileLabel})`, MARGIN, y);
+    doc.text(sanitizePdfText(`Session ${si + 1}: ${cleanTaskName} (${profileLabel})`), MARGIN, y);
     y += 7;
 
     // Metadata
@@ -266,7 +267,7 @@ export async function exportComparisonPdf(sessions: SessionRecord[]): Promise<vo
     ];
     if (s.assessor) metaParts.push(`Assessor: ${s.assessor}`);
     if (s.department) metaParts.push(`Dept: ${s.department}`);
-    doc.text(metaParts.join('   ·   '), MARGIN, y);
+    doc.text(sanitizePdfText(metaParts.join('   ·   ')), MARGIN, y);
     y += 7;
 
     // Peak risk badge
@@ -385,7 +386,7 @@ export async function exportComparisonPdf(sessions: SessionRecord[]): Promise<vo
       y += 6;
 
       for (let ri = 0; ri < Math.min(recs.length, 3); ri++) {
-        const lines = doc.splitTextToSize(recs[ri], CONTENT_W - 12);
+        const lines = doc.splitTextToSize(sanitizePdfText(recs[ri]), CONTENT_W - 12);
         const blockH = lines.length * 4.5 + 5;
         checkPage(blockH + 2, `Session ${si + 1} of ${sorted.length}`);
 
@@ -420,7 +421,7 @@ export async function exportComparisonPdf(sessions: SessionRecord[]): Promise<vo
       y += 5;
       setFont(7);
       setColor(51, 65, 85);
-      const noteLines = doc.splitTextToSize(s.notes, CONTENT_W);
+      const noteLines = doc.splitTextToSize(sanitizePdfText(s.notes), CONTENT_W);
       doc.text(noteLines, MARGIN, y);
       y += noteLines.length * 4.5 + 4;
     }
