@@ -163,13 +163,23 @@ const CONF_SOLID  = 0.50;
 const CONF_DASHED = 0.15;
 
 /**
- * drawSkeleton — draws the skeleton on a canvas that is already sized to the
- * video's rendered rect (CSS pixels) and whose context has already been scaled
- * by devicePixelRatio. W and H are the CSS-pixel dimensions of the video rect.
- *
- * Because the canvas exactly covers the video's rendered area (no black bars),
- * landmark coordinates (0–1 relative to the video frame) map directly to
- * canvas pixels via: x = lm.x * W, y = lm.y * H.
+ * letterboxRect — computes the letterbox rect for a video displayed with object-contain
+ * inside a container of size (cW × cH). The video has raw dimensions (vW × vH).
+ * Returns { x, y, w, h } in CSS pixels — the rect the video actually occupies.
+ */
+function letterboxRect(cW: number, cH: number, vW: number, vH: number) {
+  const scale = Math.min(cW / vW, cH / vH);
+  const drawW = vW * scale;
+  const drawH = vH * scale;
+  return { x: (cW - drawW) / 2, y: (cH - drawH) / 2, w: drawW, h: drawH };
+}
+
+/**
+ * drawSkeleton — draws the skeleton on a canvas that covers the full container
+ * (absolute inset-0). W/H are the container's CSS-pixel dimensions.
+ * Landmark coordinates (0–1) are relative to the raw video frame; we must
+ * apply the letterbox offset so they land on the visible video area.
+ * Handles 90° rotation (phone videos) by swapping effW/effH when detected.
  */
 function drawSkeleton(
   ctx: CanvasRenderingContext2D,
@@ -177,13 +187,25 @@ function drawSkeleton(
   landmarks: any[],
   riskColors: boolean,
   segColors: SegColors | null,
+  video?: HTMLVideoElement | null,
 ) {
   const CONF = CONF_DASHED; // minimum to draw anything
   const visibleCount = landmarks.filter(lm => lm && (lm.visibility ?? 1) >= CONF).length;
   if (visibleCount < MIN_VISIBLE_LANDMARKS) return;
 
-  const px = (nx: number) => nx * W;
-  const py = (ny: number) => ny * H;
+  // Compute letterbox rect so landmarks map to the visible video area
+  const rawW = video?.videoWidth  || W;
+  const rawH = video?.videoHeight || H;
+  // Rotation detection: if the browser auto-rotated the video, swap effective dims
+  const displayAR = W / H;
+  const rawAR = rawW / rawH;
+  const isRotated = Math.abs(displayAR - rawAR) > 0.3 && Math.abs(displayAR - (1 / rawAR)) < 0.3;
+  const effW = isRotated ? rawH : rawW;
+  const effH = isRotated ? rawW : rawH;
+  const lb = letterboxRect(W, H, effW, effH);
+
+  const px = (nx: number) => lb.x + nx * lb.w;
+  const py = (ny: number) => lb.y + ny * lb.h;
   const lw = Math.min(2, Math.max(1.5, W / 400));
   const jr = Math.min(2.5, Math.max(2, W / 250));
 
@@ -295,24 +317,17 @@ export default function VideoUpload() {
   const riskColorsRef = useRef(riskColors);
   useEffect(() => { riskColorsRef.current = riskColors; }, [riskColors]);
 
-  /**
-   * sizeCanvasToVideoRect — sizes the canvas buffer to the video element's
-   * *rendered* rect × devicePixelRatio, then scales the ctx so drawing code
-   * can work in CSS pixels. Returns the CSS-pixel {w, h} of the video rect,
-   * or null if the video hasn't laid out yet.
-   *
-   * This eliminates the half-frame black-bar problem: the canvas exactly
-   * covers the video's rendered area (object-contain letterbox already
-   * handled by the browser), so landmark coords (0–1) map directly to
-   * canvas pixels without any additional letterbox math.
-   */
+/**
+ * sizeCanvas — sizes the canvas buffer to the container's CSS size × devicePixelRatio.
+ * The canvas covers the full container (absolute inset-0), and drawSkeleton handles
+ * the letterbox offset internally using video.videoWidth/videoHeight.
+ * Returns { w, h, dpr } in CSS pixels, or null if the canvas hasn't laid out yet.
+ */
   const sizeCanvasToVideoRect = useCallback(() => {
-    const video  = videoRef.current;
     const canvas = canvasRef.current;
-    if (!video || !canvas) return null;
-    const rect = video.getBoundingClientRect();
-    const w = rect.width  > 4 ? rect.width  : video.clientWidth;
-    const h = rect.height > 4 ? rect.height : video.clientHeight;
+    if (!canvas) return null;
+    const w = canvas.offsetWidth;
+    const h = canvas.offsetHeight;
     if (w < 4 || h < 4) return null;
     const dpr = window.devicePixelRatio || 1;
     const bufW = Math.round(w * dpr);
@@ -320,18 +335,16 @@ export default function VideoUpload() {
     if (canvas.width !== bufW || canvas.height !== bufH) {
       canvas.width  = bufW;
       canvas.height = bufH;
-      canvas.style.width  = `${w}px`;
-      canvas.style.height = `${h}px`;
     }
     return { w, h, dpr };
   }, []);
 
-  // Re-size canvas whenever the video element's rendered rect changes
+  // Re-size canvas whenever the container changes size
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
     const ro = new ResizeObserver(() => sizeCanvasToVideoRect());
-    ro.observe(video);
+    ro.observe(canvas);
     sizeCanvasToVideoRect();
     return () => ro.disconnect();
   }, [sizeCanvasToVideoRect]);
@@ -464,7 +477,7 @@ export default function VideoUpload() {
         const firstSnap = snapshotsRef.current.slice().sort((a, b) => a.timestamp - b.timestamp)[0];
         const lm = firstSnap?.landmarks ?? latestLandmarksRef.current ?? [];
         const segColors = latestSegColorsRef.current;
-        drawSkeleton(ctx, W, H, lm, true, segColors);
+        drawSkeleton(ctx, W, H, lm, true, segColors, videoRef.current);
       };
       video.currentTime = 0;
       const onSeeked = () => {
@@ -542,32 +555,37 @@ export default function VideoUpload() {
       // Guard: only draw if video has decoded dimensions (readyState >= 2 = HAVE_CURRENT_DATA)
       const lm = latestLandmarksRef.current;
       if (lm && lm.length > 0 && video.readyState >= 2 && video.videoWidth > 0) {
-        drawSkeleton(ctx, W, H, lm, riskColorsRef.current, latestSegColorsRef.current);
+        drawSkeleton(ctx, W, H, lm, riskColorsRef.current, latestSegColorsRef.current, videoRef.current);
       }
 
       // Capture thumbnail at 25% of video
-      // Draw video frame + skeleton onto an offscreen canvas for the thumbnail
+      // Draw video frame + skeleton onto an offscreen canvas for the thumbnail.
+      // Crop to the letterbox rect so there are no black bars in the PDF thumbnail.
       if (!thumbnailCapturedRef.current && video.duration > 0 && video.currentTime >= video.duration * 0.25) {
         thumbnailCapturedRef.current = true;
           try {
-          // Thumbnail: draw the video at its native resolution (no black bars).
-          // The canvas is already sized to the video's rendered rect, so we
-          // draw the video to fill the entire canvas (object-contain is
-          // handled by the browser; we just fill the canvas 1:1).
+          const rawW2 = video.videoWidth  || W;
+          const rawH2 = video.videoHeight || H;
+          const displayAR2 = W / H;
+          const rawAR2 = rawW2 / rawH2;
+          const isRotated2 = Math.abs(displayAR2 - rawAR2) > 0.3 && Math.abs(displayAR2 - (1 / rawAR2)) < 0.3;
+          const effW2 = isRotated2 ? rawH2 : rawW2;
+          const effH2 = isRotated2 ? rawW2 : rawH2;
+          const lb2 = letterboxRect(W, H, effW2, effH2);
           const THUMB_DPR = window.devicePixelRatio || 1;
           const thumb = document.createElement('canvas');
-          thumb.width  = Math.round(W * THUMB_DPR);
-          thumb.height = Math.round(H * THUMB_DPR);
+          thumb.width  = Math.round(lb2.w * THUMB_DPR);
+          thumb.height = Math.round(lb2.h * THUMB_DPR);
           const tCtx = thumb.getContext('2d')!;
           tCtx.scale(THUMB_DPR, THUMB_DPR);
-          // Fill with black first (safe fallback for any sub-pixel gaps)
-          tCtx.fillStyle = '#000';
-          tCtx.fillRect(0, 0, W, H);
-          // Draw video frame filling the full canvas (no letterbox bars)
-          tCtx.drawImage(video, 0, 0, W, H);
-          // Composite skeleton overlay on top (canvas is already DPR-scaled)
-          tCtx.drawImage(canvas, 0, 0, W, H);
-          thumbnailDataUrlRef.current = thumb.toDataURL('image/jpeg', 0.85);
+          // Draw video frame cropped to the letterbox rect (no black bars)
+          tCtx.drawImage(video, 0, 0, lb2.w, lb2.h);
+          // Composite skeleton overlay: source from the overlay canvas cropped to lb rect
+          tCtx.drawImage(canvas,
+            lb2.x * THUMB_DPR, lb2.y * THUMB_DPR,
+            lb2.w * THUMB_DPR, lb2.h * THUMB_DPR,
+            0, 0, lb2.w, lb2.h);
+          thumbnailDataUrlRef.current = thumb.toDataURL('image/jpeg', 0.97);
         } catch { /* skip thumbnail */ }
       }
 
@@ -778,14 +796,8 @@ export default function VideoUpload() {
                 />
                 <canvas
                   ref={canvasRef}
-                  className="absolute"
+                  className="absolute inset-0 w-full h-full"
                   style={{
-                    // sizeCanvasToVideoRect() sets canvas.style.width/height to match
-                    // the video's rendered rect. We position it centered in the container
-                    // so it sits exactly over the video (which is also centered via object-contain).
-                    top: '50%',
-                    left: '50%',
-                    transform: 'translate(-50%, -50%)',
                     zIndex: 2,
                     pointerEvents: 'none',
                     opacity: isAnalyzing ? 1 : 0,
