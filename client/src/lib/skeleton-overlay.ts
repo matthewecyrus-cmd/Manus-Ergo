@@ -192,6 +192,14 @@ export function drawSkeleton({
     return { x: lm.x * W, y: lm.y * H, v: lm.visibility ?? 1 };
   };
 
+  // Visibility tiers
+  const CONF_SOLID  = 0.50;  // solid gradient + filled joint
+  const CONF_DASHED = 0.15;  // dashed + hollow joint (estimated position)
+  // minVisibility is the caller-supplied floor (default 0.30); we use the
+  // lower CONF_DASHED tier so landmarks between 0.15 and minVisibility are
+  // still shown as estimated rather than hidden.
+  const CONF_FLOOR  = Math.min(minVisibility, CONF_DASHED);
+
   // Draw bones
   const boneW = Math.max(2.5, W / 280);
   ctx.lineCap = "round";
@@ -200,13 +208,14 @@ export function drawSkeleton({
   // Minimum visible landmark guard — suppress skeleton when too few landmarks are
   // above the confidence threshold to avoid misleading partial skeletons.
   const MIN_VISIBLE = 15;
-  const visCount = landmarks.filter(lm => lm && (lm.visibility ?? 1) >= minVisibility).length;
+  const visCount = landmarks.filter(lm => lm && (lm.visibility ?? 1) >= CONF_FLOOR).length;
   if (visCount < MIN_VISIBLE) return;
 
   for (const [a, b] of BONES) {
     const pa = px(a), pb = px(b);
     if (!pa || !pb) continue;
-    if (pa.v < minVisibility || pb.v < minVisibility) continue;
+    if (pa.v < CONF_FLOOR || pb.v < CONF_FLOOR) continue;
+    const isDashed = pa.v < CONF_SOLID || pb.v < CONF_SOLID;
     const cA = jointColors[a] ?? C_NEUTRAL;
     const cB = jointColors[b] ?? C_NEUTRAL;
     // Always build the gradient top-to-bottom (min Y first) so that in a deep squat,
@@ -217,39 +226,69 @@ export function drawSkeleton({
       ? [pa.x, pa.y, cA, pb.x, pb.y, cB]
       : [pb.x, pb.y, cB, pa.x, pa.y, cA];
     const grad = ctx.createLinearGradient(gx1, gy1, gx2, gy2);
-    grad.addColorStop(0, gc0 + "dd");
-    grad.addColorStop(1, gc1 + "dd");
-    ctx.shadowColor = "rgba(0,0,0,0.5)";
-    ctx.shadowBlur  = 3;
+    if (isDashed) {
+      // Estimated position — muted alpha
+      grad.addColorStop(0, gc0 + "66");
+      grad.addColorStop(1, gc1 + "66");
+      ctx.setLineDash([5, 5]);
+      ctx.globalAlpha = 0.4;
+    } else {
+      grad.addColorStop(0, gc0 + "dd");
+      grad.addColorStop(1, gc1 + "dd");
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1.0;
+      ctx.shadowColor = "rgba(0,0,0,0.5)";
+      ctx.shadowBlur  = 3;
+    }
     ctx.beginPath();
     ctx.moveTo(pa.x, pa.y);
     ctx.lineTo(pb.x, pb.y);
     ctx.strokeStyle = grad;
     ctx.lineWidth   = boneW;
     ctx.stroke();
+    ctx.shadowBlur = 0;
   }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1.0;
   ctx.shadowBlur = 0;
 
   // Draw joints
   const rBase = Math.max(5, W / 100);
   for (let i = 0; i < landmarks.length; i++) {
     const lm = landmarks[i];
-    if (!lm || (lm.visibility ?? 1) < minVisibility) continue;
+    if (!lm) continue;
+    const v = lm.visibility ?? 1;
+    if (v < CONF_FLOOR) continue;
     const x = lm.x * W, y = lm.y * H;
     const color = jointColors[i] ?? C_NEUTRAL;
-    // Glow
-    ctx.beginPath(); ctx.arc(x, y, rBase * 2.0, 0, Math.PI * 2);
-    ctx.fillStyle = color + "28"; ctx.fill();
-    // Mid ring
-    ctx.beginPath(); ctx.arc(x, y, rBase * 1.4, 0, Math.PI * 2);
-    ctx.fillStyle = color + "55"; ctx.fill();
-    // Core
-    ctx.beginPath(); ctx.arc(x, y, rBase, 0, Math.PI * 2);
-    ctx.fillStyle = color; ctx.fill();
-    // Highlight
-    ctx.beginPath(); ctx.arc(x - rBase * 0.25, y - rBase * 0.25, rBase * 0.38, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+    if (v < CONF_SOLID) {
+      // Estimated position — hollow dashed circle
+      ctx.globalAlpha = 0.4;
+      ctx.beginPath();
+      ctx.arc(x, y, rBase, 0, Math.PI * 2);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = boneW;
+      ctx.setLineDash([3, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    } else {
+      // High-confidence — full glow + filled joint
+      ctx.globalAlpha = 1.0;
+      // Glow
+      ctx.beginPath(); ctx.arc(x, y, rBase * 2.0, 0, Math.PI * 2);
+      ctx.fillStyle = color + "28"; ctx.fill();
+      // Mid ring
+      ctx.beginPath(); ctx.arc(x, y, rBase * 1.4, 0, Math.PI * 2);
+      ctx.fillStyle = color + "55"; ctx.fill();
+      // Core
+      ctx.beginPath(); ctx.arc(x, y, rBase, 0, Math.PI * 2);
+      ctx.fillStyle = color; ctx.fill();
+      // Highlight
+      ctx.beginPath(); ctx.arc(x - rBase * 0.25, y - rBase * 0.25, rBase * 0.38, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.fill();
+    }
   }
+  ctx.globalAlpha = 1.0;
 
   // Score badge
   if (showBadge && scores) {

@@ -568,10 +568,26 @@ export async function exportSessionPdf(session: SessionRecord): Promise<void> {
     y += 12;
 
     try {
+      // Derive the aspect ratio from the image data so the thumbnail is not
+      // letterboxed or stretched regardless of the video's original aspect ratio.
+      // We load the data URL into an Image element to read naturalWidth/naturalHeight.
+      const imgEl = new Image();
+      await new Promise<void>((resolve) => {
+        imgEl.onload = () => resolve();
+        imgEl.onerror = () => resolve();
+        imgEl.src = thumbUrl;
+      });
+      const nW = imgEl.naturalWidth  || 16;
+      const nH = imgEl.naturalHeight || 9;
       const imgW = CONTENT_W;
-      const imgH = imgW * (9 / 16);
-      doc.addImage(thumbUrl, 'JPEG', MARGIN, y, imgW, imgH);
-      y += imgH + 4;
+      const imgH = imgW * (nH / nW);
+      // Cap height so the image doesn't overflow the page
+      const maxH = PAGE_H - y - MARGIN - 20;
+      const finalH = Math.min(imgH, maxH);
+      const finalW = finalH < imgH ? imgW * (finalH / imgH) : imgW;
+      const xOff = MARGIN + (CONTENT_W - finalW) / 2;
+      doc.addImage(thumbUrl, 'JPEG', xOff, y, finalW, finalH);
+      y += finalH + 4;
     } catch {
       setFont(8);
       setColor(148, 163, 184);

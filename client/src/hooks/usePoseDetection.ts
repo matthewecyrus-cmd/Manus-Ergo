@@ -310,10 +310,15 @@ function drawSkeleton(
   const px = (lmx: number) => lb.x + lmx * lb.w;
   const py = (lmy: number) => lb.y + lmy * lb.h;
 
+  // Visibility tiers
+  const CONF_SOLID  = 0.50;  // solid gradient + filled joint
+  const CONF_DASHED = 0.15;  // dashed + hollow joint (estimated position)
+  const CONF_FLOOR  = Math.min(VISIBILITY_THRESHOLD, CONF_DASHED);
+
   // Minimum visible landmark guard — suppress skeleton when too few landmarks are
   // above the confidence threshold to avoid misleading partial skeletons.
   const MIN_VISIBLE_LIVE = 15;
-  const visCountLive = lm.filter(l => l && (l.visibility ?? 0) >= VISIBILITY_THRESHOLD).length;
+  const visCountLive = lm.filter(l => l && (l.visibility ?? 0) >= CONF_FLOOR).length;
   if (visCountLive < MIN_VISIBLE_LIVE) return;
 
   // Draw connections — thin, round caps, gradient between different risk colors
@@ -322,38 +327,68 @@ function drawSkeleton(
   for (const [a, b] of POSE_CONNECTIONS) {
     const la = lm[a], lb2 = lm[b];
     if (!la || !lb2) continue;
-    if ((la.visibility ?? 0) < VISIBILITY_THRESHOLD || (lb2.visibility ?? 0) < VISIBILITY_THRESHOLD) continue;
+    const vaA = la.visibility ?? 0;
+    const vaB = lb2.visibility ?? 0;
+    if (vaA < CONF_FLOOR || vaB < CONF_FLOOR) continue;
+    const isDashed = vaA < CONF_SOLID || vaB < CONF_SOLID;
     const cA = colorMap[a] ?? C_SAFE;
     const cB = colorMap[b] ?? C_SAFE;
-    if (cA === cB) {
+    if (isDashed) {
+      ctx.setLineDash([4, 4]);
+      ctx.globalAlpha = 0.4;
       ctx.strokeStyle = cA;
     } else {
-      // Always build the gradient top-to-bottom (min Y first) so that in a deep squat,
-      // where the knee Y is above the hip Y in screen space, the color stops are not
-      // inverted — the joint at the higher screen position gets its own color.
-      const paY = py(la.y), pbY = py(lb2.y);
-      const topIsA = paY <= pbY;
-      const [gx1, gy1, gc0, gx2, gy2, gc1] = topIsA
-        ? [px(la.x), paY, cA, px(lb2.x), pbY, cB]
-        : [px(lb2.x), pbY, cB, px(la.x), paY, cA];
-      const grad = ctx.createLinearGradient(gx1, gy1, gx2, gy2);
-      grad.addColorStop(0, gc0);
-      grad.addColorStop(1, gc1);
-      ctx.strokeStyle = grad;
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1.0;
+      if (cA === cB) {
+        ctx.strokeStyle = cA;
+      } else {
+        // Always build the gradient top-to-bottom (min Y first) so that in a deep squat,
+        // where the knee Y is above the hip Y in screen space, the color stops are not
+        // inverted — the joint at the higher screen position gets its own color.
+        const paY = py(la.y), pbY = py(lb2.y);
+        const topIsA = paY <= pbY;
+        const [gx1, gy1, gc0, gx2, gy2, gc1] = topIsA
+          ? [px(la.x), paY, cA, px(lb2.x), pbY, cB]
+          : [px(lb2.x), pbY, cB, px(la.x), paY, cA];
+        const grad = ctx.createLinearGradient(gx1, gy1, gx2, gy2);
+        grad.addColorStop(0, gc0);
+        grad.addColorStop(1, gc1);
+        ctx.strokeStyle = grad;
+      }
     }
     ctx.beginPath();
     ctx.moveTo(px(la.x), py(la.y));
     ctx.lineTo(px(lb2.x), py(lb2.y));
     ctx.stroke();
   }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1.0;
 
-  // Draw joints — clean 2.5px dots, no halos
+  // Draw joints
   for (let i = 0; i < lm.length; i++) {
     const pt = lm[i];
-    if (!pt || (pt.visibility ?? 0) < VISIBILITY_THRESHOLD) continue;
-    ctx.beginPath();
-    ctx.arc(px(pt.x), py(pt.y), 2.5, 0, Math.PI * 2);
-    ctx.fillStyle = colorMap[i] ?? C_SAFE;
-    ctx.fill();
+    if (!pt) continue;
+    const v = pt.visibility ?? 0;
+    if (v < CONF_FLOOR) continue;
+    if (v < CONF_SOLID) {
+      // Estimated position — hollow dashed circle
+      ctx.globalAlpha = 0.4;
+      ctx.beginPath();
+      ctx.arc(px(pt.x), py(pt.y), 3, 0, Math.PI * 2);
+      ctx.strokeStyle = colorMap[i] ?? C_SAFE;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([2, 2]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    } else {
+      // High-confidence — solid filled dot
+      ctx.globalAlpha = 1.0;
+      ctx.beginPath();
+      ctx.arc(px(pt.x), py(pt.y), 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = colorMap[i] ?? C_SAFE;
+      ctx.fill();
+    }
   }
+  ctx.globalAlpha = 1.0;
 }
