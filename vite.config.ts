@@ -1,10 +1,12 @@
-import { jsxLocPlugin } from "@builder.io/vite-plugin-jsx-loc";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import fs from "node:fs";
 import path from "node:path";
 import { defineConfig, type Plugin, type ViteDevServer } from "vite";
-import { vitePluginManusRuntime } from "vite-plugin-manus-runtime";
+// NOTE: Manus dev-only plugins (@builder.io/vite-plugin-jsx-loc,
+// vite-plugin-manus-runtime) are intentionally NOT imported at top level.
+// They are dynamically imported below only for the dev server, so a
+// production / on-prem build neither imports nor requires those packages.
 
 // =============================================================================
 // Manus Debug Collector - Vite Plugin
@@ -203,39 +205,65 @@ function vitePluginStorageProxy(): Plugin {
   };
 }
 
-const plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector(), vitePluginStorageProxy()];
+// ── Plugin selection ──────────────────────────────────────────────────────────
+// Manus dev tooling (runtime injector, JSX-loc, debug collector, storage proxy)
+// must NEVER ship in a production build. They load ONLY for the dev server
+// (command === 'serve'), and only if the packages are present. A production
+// build — including the on-prem / ITAR Electron build — gets ONLY react +
+// tailwind: no Manus runtime, no /__manus__ endpoints, no forge/storage refs,
+// and no dependency on any Manus-private package to build.
+export default defineConfig(async ({ command }) => {
+  const plugins: Plugin[] = [react(), tailwindcss()];
 
-export default defineConfig({
-  plugins,
-  resolve: {
-    alias: {
-      "@": path.resolve(import.meta.dirname, "client", "src"),
-      "@shared": path.resolve(import.meta.dirname, "shared"),
-      "@assets": path.resolve(import.meta.dirname, "attached_assets"),
+  if (command === "serve") {
+    try {
+      const [{ jsxLocPlugin }, { vitePluginManusRuntime }] = await Promise.all([
+        import("@builder.io/vite-plugin-jsx-loc"),
+        import("vite-plugin-manus-runtime"),
+      ]);
+      plugins.push(
+        jsxLocPlugin(),
+        vitePluginManusRuntime(),
+        vitePluginManusDebugCollector(),
+        vitePluginStorageProxy(),
+      );
+    } catch {
+      // Manus packages not installed (e.g. an on-prem dev checkout) — fine.
+    }
+  }
+
+  return {
+    plugins,
+    resolve: {
+      alias: {
+        "@": path.resolve(import.meta.dirname, "client", "src"),
+        "@shared": path.resolve(import.meta.dirname, "shared"),
+        "@assets": path.resolve(import.meta.dirname, "attached_assets"),
+      },
     },
-  },
-  envDir: path.resolve(import.meta.dirname),
-  root: path.resolve(import.meta.dirname, "client"),
-  build: {
-    outDir: path.resolve(import.meta.dirname, "dist/public"),
-    emptyOutDir: true,
-  },
-  server: {
-    port: 3000,
-    strictPort: false, // Will find next available port if 3000 is busy
-    host: true,
-    allowedHosts: [
-      ".manuspre.computer",
-      ".manus.computer",
-      ".manus-asia.computer",
-      ".manuscomputer.ai",
-      ".manusvm.computer",
-      "localhost",
-      "127.0.0.1",
-    ],
-    fs: {
-      strict: true,
-      deny: ["**/.*"],
+    envDir: path.resolve(import.meta.dirname),
+    root: path.resolve(import.meta.dirname, "client"),
+    build: {
+      outDir: path.resolve(import.meta.dirname, "dist/public"),
+      emptyOutDir: true,
     },
-  },
+    server: {
+      port: 3000,
+      strictPort: false, // Will find next available port if 3000 is busy
+      host: true,
+      allowedHosts: [
+        ".manuspre.computer",
+        ".manus.computer",
+        ".manus-asia.computer",
+        ".manuscomputer.ai",
+        ".manusvm.computer",
+        "localhost",
+        "127.0.0.1",
+      ],
+      fs: {
+        strict: true,
+        deny: ["**/.*"],
+      },
+    },
+  };
 });

@@ -349,7 +349,14 @@ function drawReplayFrame(
   const drawX = (W - drawW) / 2;
   const drawY = (H - drawH) / 2;
 
-  const CONF = 0.25;
+  // Visibility tiers — consistent with skeleton-overlay.ts and the live
+  // overlays. Solid = confident (≥0.50); dashed + muted = estimated/occluded
+  // (0.15–0.50); hidden = below floor. The dash is the honesty signal that a
+  // limb's position — and therefore its joint angle and RULA/REBA contribution
+  // — was inferred by the pose model, not directly observed. Critical in the
+  // report, which is the artifact a reviewing ergonomist scrutinizes.
+  const CONF_SOLID = 0.50;
+  const CONF_DASHED = 0.15;
   const lw = Math.min(2, Math.max(1.5, drawW / 400));
   const jr = Math.min(2.5, Math.max(2, drawW / 250));
 
@@ -364,22 +371,45 @@ function drawReplayFrame(
     const la = landmarks[conn.a];
     const lb = landmarks[conn.b];
     if (!la || !lb) continue;
-    if ((la.visibility ?? 1) < CONF || (lb.visibility ?? 1) < CONF) continue;
+    const va = la.visibility ?? 1;
+    const vb = lb.visibility ?? 1;
+    // Hide only when truly unreliable; show estimated limbs dashed rather than
+    // dropping them (occluded ≠ absent).
+    if (va < CONF_DASHED || vb < CONF_DASHED) continue;
+    const isDashed = va < CONF_SOLID || vb < CONF_SOLID;
     ctx.beginPath();
     ctx.moveTo(px(la.x), py(la.y));
     ctx.lineTo(px(lb.x), py(lb.y));
     ctx.strokeStyle = (riskColors && segColors) ? segColors[conn.seg] : CYAN;
+    ctx.setLineDash(isDashed ? [4, 4] : []);
+    ctx.globalAlpha = isDashed ? 0.45 : 1.0;
     ctx.stroke();
   }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1.0;
 
   for (let i = 0; i < landmarks.length; i++) {
     const pt = landmarks[i];
-    if (!pt || (pt.visibility ?? 1) < CONF) continue;
+    if (!pt) continue;
+    const v = pt.visibility ?? 1;
+    if (v < CONF_DASHED) continue;
     const seg = REPLAY_JOINT_SEG[i] ?? 'trunk';
+    const color = (riskColors && segColors) ? segColors[seg] : CYAN;
     ctx.beginPath();
     ctx.arc(px(pt.x), py(pt.y), jr, 0, Math.PI * 2);
-    ctx.fillStyle = (riskColors && segColors) ? segColors[seg] : CYAN;
-    ctx.fill();
+    if (v < CONF_SOLID) {
+      // Estimated joint — hollow dashed ring instead of a filled dot.
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lw;
+      ctx.setLineDash([2, 2]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1.0;
+    } else {
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
   }
 }
 
@@ -1056,22 +1086,34 @@ export default function SessionReport() {
         const rawQuality = persistedQuality ?? fallbackQuality;
         // Map to display label (add 'excellent' tier for 0 clamped frames)
         const quality = (clamped === 0 ? 'excellent' : rawQuality) as 'excellent' | 'good' | 'fair' | 'poor';
+        // Measurement-confidence framing. This badge reports how reliably the
+        // camera tracked the body — NOT the worker's ergonomic risk. Avoid
+        // alarm-coded color/labels ("Poor" + 🔴) that read as a risk finding;
+        // the lowest tier means "verify against video", not "danger".
+        const qLabel = {
+          excellent: 'High',
+          good:      'High',
+          fair:      'Moderate',
+          poor:      'Limited',
+        } as const;
         const qColors = {
           excellent: 'bg-green-50 border-green-200 text-green-800',
           good:      'bg-green-50 border-green-200 text-green-800',
-          fair:      'bg-amber-50 border-amber-200 text-amber-800',
-          poor:      'bg-red-50 border-red-200 text-red-800',
+          fair:      'bg-slate-50 border-slate-200 text-slate-700',
+          poor:      'bg-slate-50 border-slate-200 text-slate-700',
         };
-        const qIcons = { excellent: '✅', good: '✅', fair: '⚠️', poor: '🔴' };
+        const qIcons = { excellent: '✅', good: '✅', fair: 'ℹ️', poor: 'ℹ️' };
         return (
           <div className={`flex items-center gap-3 px-4 py-2.5 rounded-lg border text-sm ${qColors[quality]}`}>
             <span className="text-base">{qIcons[quality]}</span>
             <div className="flex-1">
-              <span className="font-semibold">Tracking Quality: {quality.charAt(0).toUpperCase() + quality.slice(1)}</span>
+              <span className="font-semibold">Tracking Confidence: {qLabel[quality]}</span>
               <span className="ml-2 font-normal opacity-80">
                 {clamped === 0
                   ? `All ${total} frames passed the anatomical plausibility check.`
-                  : `${clamped} of ${total} frames (${pct}%) had at least one joint angle clamped by the plausibility guard.`
+                  : quality === 'poor'
+                    ? `${clamped} of ${total} frames (${pct}%) needed a joint angle corrected by the plausibility guard — review the peak frames against the source video before acting on scores.`
+                    : `${clamped} of ${total} frames (${pct}%) had at least one joint angle corrected by the plausibility guard.`
                 }
               </span>
             </div>

@@ -52,8 +52,8 @@ import { EMAFilter, computeSnapshot, riskLabel, summarizeSession, extractAngles,
 import type { TaskProfile, ErgoSnapshot, SessionSource, SessionRecord, BodyAngles, MotionProfileKey } from '@/lib/ergo-engine';
 import { saveVideo } from '@/lib/video-store';
 
-const MEDIAPIPE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
-const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
+const MEDIAPIPE_CDN = '/mediapipe/wasm';
+const MODEL_URL = '/mediapipe/models/pose_landmarker_full.task';
 
 type AnalysisState = 'idle' | 'loading-model' | 'analyzing' | 'done' | 'error';
 
@@ -301,6 +301,9 @@ export default function VideoUpload() {
   // EMA alpha 0.45: responsive enough to track normal movement, but with velocity clamping
   // in EMAFilter to prevent landmark jump artifacts during fast motion
   const emaRef = useRef(new EMAFilter(0.45));
+  const emaWorldRef = useRef(new EMAFilter(0.45));
+  const latestWorldLandmarksRef = useRef<any[] | null>(null);
+  const latestHasWorldRef = useRef<boolean>(false);
   const taskProfileRef = useRef<TaskProfile>(taskProfile);
 
   // Refs for the overlay loop — no React state updates per frame
@@ -525,6 +528,8 @@ export default function VideoUpload() {
           const result = poseLandmarkerRef.current.detectForVideo(video, timestampMs);
           if (result?.landmarks?.length > 0) {
             const raw = result.landmarks[0];
+            const worldRaw = result.worldLandmarks?.[0];
+            const hasWorld = !!worldRaw;
 
             // Confidence gating: compute average visibility of key structural landmarks
             // (shoulders, hips, knees — indices 11,12,23,24,25,26)
@@ -534,17 +539,23 @@ export default function VideoUpload() {
             const avgConf = KEY_LM.reduce((sum, i) => sum + (raw[i]?.visibility ?? 0), 0) / KEY_LM.length;
 
             if (avgConf >= 0.35) {
-              // Good confidence — update with smoothed landmarks
+              // Image landmarks → overlay position + replay. Smooth and keep.
               const smoothed = emaRef.current.smooth(raw);
               latestLandmarksRef.current = smoothed;
-              // Compute segment colors (cheap — just angle math)
-              const { angles } = extractAngles(smoothed);
+              // World landmarks → validated scoring engine. Smooth separately.
+              const smoothedWorld = hasWorld ? emaWorldRef.current.smooth(worldRaw) : smoothed;
+              latestWorldLandmarksRef.current = smoothedWorld;
+              latestHasWorldRef.current = hasWorld;
+              // Segment colors from the validated (world-space) angles so the
+              // overlay coloring matches the scored risk.
+              const { angles } = extractAngles(smoothedWorld, hasWorld);
               latestSegColorsRef.current = getSegmentColors(angles);
             }
             // else: low confidence (fast motion / occlusion) — keep last valid landmarks
             // The EMA smoother will naturally decay toward the new position once tracking recovers
           } else {
             latestLandmarksRef.current = null;
+            latestWorldLandmarksRef.current = null;
             latestSegColorsRef.current = null;
             emaRef.current.reset(); // Reset EMA so it doesn't blend stale data when tracking resumes
           }
@@ -627,7 +638,10 @@ export default function VideoUpload() {
       if (!lm) return;
       lastReportTimeRef.current = Date.now();
 
-      const snap = computeSnapshot(lm, taskProfileRef.current, MOTION_PROFILES[motionProfileKeyRef.current]);
+      // Score from WORLD landmarks (validated path); store IMAGE landmarks on
+      // the snapshot for replay overlay positioning.
+      const worldLm = latestWorldLandmarksRef.current ?? lm;
+      const snap = computeSnapshot(worldLm, taskProfileRef.current, MOTION_PROFILES[motionProfileKeyRef.current], latestHasWorldRef.current);
       if (snap) {
         snapshotsRef.current.push({ ...snap, timestamp: video.currentTime * 1000, landmarks: lm });
         // Use startTransition so React batches these low-priority UI updates

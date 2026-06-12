@@ -12,9 +12,11 @@ import type { Landmarks, ErgoSnapshot } from '@/lib/ergo-engine';
 import { EMAFilter, computeSnapshot, DEFAULT_TASK_PROFILE, resetAngleState } from '@/lib/ergo-engine';
 import type { TaskProfile } from '@/lib/ergo-engine';
 
-// MediaPipe CDN for WASM + model (offline: swap to local /public path)
-const MEDIAPIPE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
-const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+// MediaPipe assets — served LOCALLY from the app bundle (no internet).
+// Vendored by scripts/vendor-mediapipe.mjs into client/public/mediapipe/.
+// ITAR/on-prem: nothing here may resolve to a remote origin.
+const MEDIAPIPE_CDN = '/mediapipe/wasm';
+const MODEL_URL = '/mediapipe/models/pose_landmarker_lite.task';
 
 export type PoseStatus =
   | 'idle'
@@ -56,6 +58,7 @@ export function usePoseDetection(
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
   const emaFilterRef = useRef(new EMAFilter(0.25));
+  const emaWorldFilterRef = useRef(new EMAFilter(0.25));
   const taskProfileRef = useRef<TaskProfile>(DEFAULT_TASK_PROFILE);
   const fpsCounterRef = useRef({ frames: 0, lastTime: performance.now() });
   const runningRef = useRef(false);
@@ -120,12 +123,15 @@ export function usePoseDetection(
     if (result.landmarks && result.landmarks.length > 0) {
       const raw = result.landmarks[0] as Landmarks;
       const world = result.worldLandmarks?.[0] as Landmarks ?? raw;
+      const hasWorld = !!(result.worldLandmarks && result.worldLandmarks.length > 0);
 
-      // Apply EMA smoothing
+      // Image landmarks drive the overlay (normalised [0,1]); smooth them for
+      // stable rendering. World landmarks drive the validated scoring engine.
       const smoothed = emaFilterRef.current.smooth(raw);
+      const smoothedWorld = hasWorld ? emaWorldFilterRef.current.smooth(world) : smoothed;
 
-      // Compute ergonomic snapshot
-      const snap = computeSnapshot(smoothed, taskProfileRef.current);
+      // Compute ergonomic snapshot from WORLD landmarks (validated path).
+      const snap = computeSnapshot(smoothedWorld, taskProfileRef.current, undefined, hasWorld);
 
       setLandmarks(smoothed);
       setWorldLandmarks(world);
@@ -168,6 +174,7 @@ export function usePoseDetection(
         await video.play();
       }
       emaFilterRef.current.reset();
+      emaWorldFilterRef.current.reset();
       resetAngleState(); // clear hold-last-valid state from any previous session
       runningRef.current = true;
       setStatus('running');
@@ -188,6 +195,7 @@ export function usePoseDetection(
     const video = videoRef.current;
     if (video) { video.srcObject = null; }
     emaFilterRef.current.reset();
+    emaWorldFilterRef.current.reset();
     setStatus('idle');
     setLandmarks(null);
     setSnapshot(null);

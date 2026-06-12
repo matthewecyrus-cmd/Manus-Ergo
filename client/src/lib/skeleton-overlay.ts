@@ -154,6 +154,17 @@ export interface DrawOptions {
    */
   displayWidth: number;
   displayHeight: number;
+  /**
+   * RAW video frame dimensions (video.videoWidth / video.videoHeight).
+   * Required for letterbox correction: MediaPipe normalises landmarks to the
+   * raw frame, but the element renders with object-contain, which centers the
+   * frame inside displayWidth×displayHeight and pads the remainder. Without
+   * these, the skeleton drifts off the body whenever the camera aspect ratio
+   * differs from the display box. If omitted, falls back to the full box
+   * (correct only when aspect ratios already match).
+   */
+  rawVideoWidth?: number;
+  rawVideoHeight?: number;
   minVisibility?: number;
   showBadge?: boolean;
 }
@@ -165,6 +176,8 @@ export function drawSkeleton({
   canvas,
   displayWidth,
   displayHeight,
+  rawVideoWidth,
+  rawVideoHeight,
   minVisibility = 0.30,
   showBadge = true,
 }: DrawOptions): void {
@@ -184,12 +197,28 @@ export function drawSkeleton({
 
   const W = displayWidth;
   const H = displayHeight;
+
+  // ─── LETTERBOX CORRECTION ────────────────────────────────────────────────
+  // MediaPipe landmarks are normalised [0,1] to the RAW video frame. The video
+  // element renders with object-contain, which scales the frame uniformly to
+  // fit W×H and centers it, leaving padding (letterbox/pillarbox) on the
+  // remaining axis. We map landmarks into that inner content rect so the
+  // skeleton tracks the body instead of the full canvas box.
+  let ox = 0, oy = 0, cw = W, ch = H;
+  if (rawVideoWidth && rawVideoHeight && rawVideoWidth > 0 && rawVideoHeight > 0) {
+    const scale = Math.min(W / rawVideoWidth, H / rawVideoHeight);
+    cw = rawVideoWidth * scale;
+    ch = rawVideoHeight * scale;
+    ox = (W - cw) / 2;
+    oy = (H - ch) / 2;
+  }
+
   const jointColors = buildJointColors(scores, angles);
 
   const px = (idx: number) => {
     const lm = landmarks[idx];
     if (!lm) return null;
-    return { x: lm.x * W, y: lm.y * H, v: lm.visibility ?? 1 };
+    return { x: ox + lm.x * cw, y: oy + lm.y * ch, v: lm.visibility ?? 1 };
   };
 
   // Visibility tiers
@@ -259,7 +288,7 @@ export function drawSkeleton({
     if (!lm) continue;
     const v = lm.visibility ?? 1;
     if (v < CONF_FLOOR) continue;
-    const x = lm.x * W, y = lm.y * H;
+    const x = ox + lm.x * cw, y = oy + lm.y * ch;
     const color = jointColors[i] ?? C_NEUTRAL;
     if (v < CONF_SOLID) {
       // Estimated position — hollow dashed circle
@@ -326,5 +355,11 @@ export function drawSkeletonOnVideo(
   const rect = videoEl.getBoundingClientRect();
   const displayWidth  = rect.width  > 0 ? rect.width  : videoEl.clientWidth  || 640;
   const displayHeight = rect.height > 0 ? rect.height : videoEl.clientHeight || 360;
-  drawSkeleton({ landmarks, scores, angles, canvas: canvasEl, displayWidth, displayHeight, minVisibility, showBadge: true });
+  drawSkeleton({
+    landmarks, scores, angles, canvas: canvasEl,
+    displayWidth, displayHeight,
+    rawVideoWidth: videoEl.videoWidth,
+    rawVideoHeight: videoEl.videoHeight,
+    minVisibility, showBadge: true,
+  });
 }

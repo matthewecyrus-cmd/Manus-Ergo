@@ -13,7 +13,22 @@
  *   - REBA  (Rapid Entire Body Assessment)
  *   - NIOSH Lifting Equation (Revised)
  *   - RSI   (Repetitive Strain Index)
+ *
+ * SCORING ENGINE (June 2026): RULA/REBA and joint-angle computation are now
+ * delegated to the validated Pose2Sim engine in ./pose2sim-engine. That engine
+ * is a verbatim port of ErgoKit_latest.html, proven numerically identical to the
+ * validated source (see __tests__/pose2sim-engine.parity.test.ts). The functions
+ * below (extractAngles / calcRULA / calcREBA) are thin adapters that translate
+ * between Manus's BodyAngles/ScoreResult/TaskProfile types and the engine.
  */
+
+import {
+  calcAngles as p2sCalcAngles,
+  calcRULA as p2sCalcRULA,
+  calcREBA as p2sCalcREBA,
+  type P2SAngles,
+  type P2STaskInputs,
+} from './pose2sim-engine';
 
 // ─── MediaPipe landmark indices (BlazePose 33-point model) ───────────────────
 export const MP = {
@@ -88,6 +103,15 @@ export interface BodyAngles {
   /** Forearm crossing midline — positive = arm crosses body center. RULA lower-arm +1 penalty. */
   leftForearmCross: number;
   rightForearmCross: number;
+  /**
+   * Raw output of the validated Pose2Sim engine for this frame. Carries the
+   * boolean posture flags (shoulderRaised, armAbducted, laCross, wrBent,
+   * bilateral) and signed joint angles that BodyAngles cannot represent.
+   * calcRULA/calcREBA score from THIS object, not the mapped fields above, so
+   * the scores match the validated engine exactly. Survives validateAngles()
+   * (which spreads). Optional only so hand-built test fixtures stay valid.
+   */
+  _p2s?: P2SAngles;
 }
 
 export interface TaskProfile {
@@ -469,121 +493,9 @@ let _lastValidAngles: BodyAngles | null = null;
 export function resetAngleState() { _lastValidAngles = null; }
 
 // ─── BODY ANGLE EXTRACTION ───────────────────────────────────────────────────
-export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidence: number } {
-  const frame = torsoFrame(lm);
-  const prev = _lastValidAngles;
-
-  function safeAngle(a: number, b: number, c: number, fallback: number): number {
-    const r = gatedAngle(lm, a, b, c);
-    return r ? r.angle : fallback;
-  }
-
-  // Neck flexion: ear–shoulder–hip plane, torso-normalized
-  let neckFlexion = 0;
-  let neckLateral = 0;
-  if (frame) {
-    const ls = lm[MP.LEFT_SHOULDER], rs = lm[MP.RIGHT_SHOULDER];
-    const midShoulder: Vec3 = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2, z: (ls.z + rs.z) / 2 };
-    const nose = lm[MP.NOSE];
-    if ((nose.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
-      const headVec = sub(nose, midShoulder);
-      const headInPlane = projectOntoPlane(headVec, frame.right); // sagittal plane
-      const headLateral = projectOntoPlane(headVec, frame.forward); // frontal plane
-      // Positive = head forward (flexion), negative = head back (extension).
-      // REBA/RULA only penalise forward flexion; clamp to [0, 90].
-      const rawNeckFlex = (Math.atan2(dot(headInPlane, frame.forward), dot(headInPlane, frame.up)) * 180) / Math.PI;
-      neckFlexion = Math.min(90, Math.max(0, rawNeckFlex));
-      neckLateral = Math.abs((Math.atan2(dot(headLateral, frame.right), dot(headLateral, frame.up)) * 180) / Math.PI);
-    }
-  }
-
-  // Trunk flexion (torso-normalized)
-  // Uses 2D image-plane approach for reliability: MediaPipe z-depth is noisy.
-  // Trunk flexion = angle of spine vector from vertical in the image plane.
-  // This is the most reliable measure from a monocular camera.
-  let trunkFlexion = 0, trunkLateral = 0, trunkRotation = 0;
-  {
-    const lh = lm[MP.LEFT_HIP], rh = lm[MP.RIGHT_HIP];
-    const ls = lm[MP.LEFT_SHOULDER], rs = lm[MP.RIGHT_SHOULDER];
-    const allVis = [ls, rs, lh, rh].every(p => (p.visibility ?? 0) >= VISIBILITY_THRESHOLD);
-    if (allVis) {
-      const midHip: Vec3 = { x: (lh.x + rh.x) / 2, y: (lh.y + rh.y) / 2, z: 0 };
-      const midShoulder: Vec3 = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2, z: 0 };
-      // 2D spine vector (image coords: y increases downward)
-      const dx = midShoulder.x - midHip.x;
-      const dy = midShoulder.y - midHip.y; // negative = shoulder above hip (normal)
-      // Angle from vertical: 0° = upright, 90° = horizontal
-      // atan2(|dx|, |dy|) gives deviation from vertical axis
-      trunkFlexion = Math.min(90, Math.abs((Math.atan2(Math.abs(dx), Math.abs(dy)) * 180) / Math.PI));
-      // Lateral bending: asymmetry of shoulder vs hip horizontal positions
-      const shoulderWidth = Math.abs(rs.x - ls.x);
-      const hipWidth = Math.abs(rh.x - lh.x);
-      if (shoulderWidth > 0.01 && hipWidth > 0.01) {
-        const shoulderMidX = (ls.x + rs.x) / 2;
-        const hipMidX = (lh.x + rh.x) / 2;
-        const lateralShift = Math.abs(shoulderMidX - hipMidX);
-        const refWidth = (shoulderWidth + hipWidth) / 2;
-        trunkLateral = Math.min(45, (lateralShift / refWidth) * 45);
-      }
-      // Rotation: shoulder vs hip alignment (3D z-depth)
-      if (frame) {
-        const shoulderVec = norm(sub(rs, ls));
-        const hipVec = norm(sub(rh, lh));
-        const rotCos = Math.max(-1, Math.min(1, dot(shoulderVec, hipVec)));
-        trunkRotation = Math.min(45, (Math.acos(rotCos) * 180) / Math.PI);
-      }
-    }
-  }
-
-  // Upper arm elevation: angle of shoulder–elbow vector from the torso vertical.
-  // REBA/RULA measure how far the arm is raised from the side of the body.
-  // We compute this in 2D image plane: angle of (elbow - shoulder) from (hip - shoulder) direction.
-  // This gives 0° when arm hangs straight down, 90° when arm is horizontal.
-  let leftUpperArm  = prev?.leftUpperArm  ?? 0;
-  let rightUpperArm = prev?.rightUpperArm ?? 0;
-  {
-    const ls = lm[MP.LEFT_SHOULDER],  le = lm[MP.LEFT_ELBOW],  lh2 = lm[MP.LEFT_HIP];
-    const rs = lm[MP.RIGHT_SHOULDER], re = lm[MP.RIGHT_ELBOW], rh2 = lm[MP.RIGHT_HIP];
-    if ((ls.visibility ?? 0) >= VISIBILITY_THRESHOLD && (le.visibility ?? 0) >= VISIBILITY_THRESHOLD &&
-        (lh2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
-      // Torso down vector: shoulder → hip
-      const torsoDownL = norm({ x: lh2.x - ls.x, y: lh2.y - ls.y, z: 0 });
-      const armVecL = norm({ x: le.x - ls.x, y: le.y - ls.y, z: 0 });
-      const cosL = Math.max(-1, Math.min(1, torsoDownL.x * armVecL.x + torsoDownL.y * armVecL.y));
-      // Angle from torso-down: 0° = arm at side, 90° = arm horizontal, 180° = arm overhead
-      leftUpperArm = Math.min(180, (Math.acos(cosL) * 180) / Math.PI);
-    }
-    if ((rs.visibility ?? 0) >= VISIBILITY_THRESHOLD && (re.visibility ?? 0) >= VISIBILITY_THRESHOLD &&
-        (rh2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
-      const torsoDownR = norm({ x: rh2.x - rs.x, y: rh2.y - rs.y, z: 0 });
-      const armVecR = norm({ x: re.x - rs.x, y: re.y - rs.y, z: 0 });
-      const cosR = Math.max(-1, Math.min(1, torsoDownR.x * armVecR.x + torsoDownR.y * armVecR.y));
-      rightUpperArm = Math.min(180, (Math.acos(cosR) * 180) / Math.PI);
-    }
-  }
-
-  // Lower arm (elbow angle)
-  const leftLowerArm  = safeAngle(MP.LEFT_SHOULDER,  MP.LEFT_ELBOW,  MP.LEFT_WRIST,  prev?.leftLowerArm  ?? 90);
-  const rightLowerArm = safeAngle(MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, MP.RIGHT_WRIST, prev?.rightLowerArm ?? 90);
-
-  // Wrist deviation from neutral (0° = straight wrist, 90° = fully flexed/extended)
-  // angleBetween returns the included angle at the wrist joint (180° = straight).
-  // Deviation = 180° - included_angle, so a straight wrist correctly scores 0°.
-  const _lwRaw = safeAngle(MP.LEFT_ELBOW,  MP.LEFT_WRIST,  MP.LEFT_INDEX,  180 - (prev?.leftWrist  ?? 0));
-  const _rwRaw = safeAngle(MP.RIGHT_ELBOW, MP.RIGHT_WRIST, MP.RIGHT_INDEX, 180 - (prev?.rightWrist ?? 0));
-  const leftWrist  = Math.max(0, 180 - _lwRaw);
-  const rightWrist = Math.max(0, 180 - _rwRaw);
-
-  // Knee angles
-  const leftKnee  = safeAngle(MP.LEFT_HIP,  MP.LEFT_KNEE,  MP.LEFT_ANKLE,  prev?.leftKnee  ?? 180);
-  const rightKnee = safeAngle(MP.RIGHT_HIP, MP.RIGHT_KNEE, MP.RIGHT_ANKLE, prev?.rightKnee ?? 180);
-
-  // Hip flexion: deviation from straight (0° = upright standing, 90° = sitting)
-  // safeAngle returns included angle (180° = straight). Flexion = 180° - included.
-  const _hipRaw = safeAngle(MP.LEFT_SHOULDER, MP.LEFT_HIP, MP.LEFT_KNEE, 180 - (prev?.hipFlexion ?? 0));
-  const hipFlexion = Math.max(0, 180 - _hipRaw);
-
-  // Average confidence of key joints
+export function extractAngles(lm: Landmarks, isWorld: boolean = false): { angles: BodyAngles; avgConfidence: number } {
+  // Average detection confidence over the key load-bearing joints (unchanged
+  // metric — still used by computeSnapshot's visibility gate).
   const keyJoints = [
     MP.LEFT_SHOULDER, MP.RIGHT_SHOULDER, MP.LEFT_ELBOW, MP.RIGHT_ELBOW,
     MP.LEFT_WRIST, MP.RIGHT_WRIST, MP.LEFT_HIP, MP.RIGHT_HIP,
@@ -591,162 +503,74 @@ export function extractAngles(lm: Landmarks): { angles: BodyAngles; avgConfidenc
   ];
   const avgConfidence = keyJoints.reduce((s, i) => s + (lm[i]?.visibility ?? 0), 0) / keyJoints.length;
 
-  // Shoulder abduction — arm raised out to the side (torso-frame projection)
-  let leftShoulderAbduction  = prev?.leftShoulderAbduction  ?? 0;
-  let rightShoulderAbduction = prev?.rightShoulderAbduction ?? 0;
-  if (frame) {
-    const ls = lm[MP.LEFT_SHOULDER],  le2 = lm[MP.LEFT_ELBOW];
-    const rs = lm[MP.RIGHT_SHOULDER], re2 = lm[MP.RIGHT_ELBOW];
-    if ((ls.visibility ?? 0) >= VISIBILITY_THRESHOLD && (le2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
-      const lArmVec = norm(sub(le2, ls));
-      leftShoulderAbduction = Math.abs((Math.asin(Math.max(-1, Math.min(1, dot(lArmVec, frame.right)))) * 180) / Math.PI);
-    }
-    if ((rs.visibility ?? 0) >= VISIBILITY_THRESHOLD && (re2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
-      const rArmVec = norm(sub(re2, rs));
-      rightShoulderAbduction = Math.abs((Math.asin(Math.max(-1, Math.min(1, dot(rArmVec, frame.right)))) * 180) / Math.PI);
-    }
-  }
+  // Run the validated Pose2Sim engine. Pass worldLandmarks with isWorld=true
+  // (the validated path); image landmarks with isWorld=false are a fallback.
+  const p = p2sCalcAngles(
+    lm as unknown as { x: number; y: number; z: number; visibility?: number }[],
+    isWorld,
+  );
 
-  // Forearm crossing midline (RULA lower-arm penalty)
-  let leftForearmCross  = prev?.leftForearmCross  ?? 0;
-  let rightForearmCross = prev?.rightForearmCross ?? 0;
-  if (frame) {
-    const le3 = lm[MP.LEFT_ELBOW],  lw2 = lm[MP.LEFT_WRIST];
-    const re3 = lm[MP.RIGHT_ELBOW], rw2 = lm[MP.RIGHT_WRIST];
-    if ((le3.visibility ?? 0) >= VISIBILITY_THRESHOLD && (lw2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
-      const lForeVec = norm(sub(lw2, le3));
-      leftForearmCross = Math.max(0, dot(lForeVec, frame.right) * 90);
-    }
-    if ((re3.visibility ?? 0) >= VISIBILITY_THRESHOLD && (rw2.visibility ?? 0) >= VISIBILITY_THRESHOLD) {
-      const rForeVec = norm(sub(rw2, re3));
-      rightForearmCross = Math.max(0, -dot(rForeVec, frame.right) * 90);
-    }
-  }
+  const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
+  // Map the engine's angle object into Manus's BodyAngles for the heat-map,
+  // body-region rollup, and the plausibility-guard tracking metric. SCORING
+  // does NOT use these mapped fields — calcRULA/calcREBA read angles._p2s — so
+  // approximations here (boolean flags expanded to representative angles, hip
+  // proxied by trunk) never affect RULA/REBA validity.
   const angles: BodyAngles = {
-    neckFlexion, neckLateral, trunkFlexion, trunkLateral, trunkRotation,
-    leftUpperArm, rightUpperArm, leftLowerArm, rightLowerArm,
-    leftWrist, rightWrist, leftKnee, rightKnee, hipFlexion,
-    leftShoulderAbduction, rightShoulderAbduction,
-    leftForearmCross, rightForearmCross,
+    neckFlexion: clamp(p.nf, 0, 90),
+    neckLateral: clamp(p.ns, 0, 90),
+    trunkFlexion: clamp(p.tf, 0, 90),
+    trunkLateral: clamp(p.ts, 0, 90),
+    trunkRotation: clamp(p.trunkRot, 0, 90),
+    leftUpperArm: clamp(Math.abs(p.joints.lShoulder), 0, 180),
+    rightUpperArm: clamp(Math.abs(p.joints.rShoulder), 0, 180),
+    leftLowerArm: clamp(Math.abs(p.joints.lElbow), 0, 180),
+    rightLowerArm: clamp(Math.abs(p.joints.rElbow), 0, 180),
+    leftWrist: clamp(Math.abs(p.joints.lWrist), 0, 90),
+    rightWrist: clamp(Math.abs(p.joints.rWrist), 0, 90),
+    // Engine knee = flexion from straight (0=straight); BodyAngles knee =
+    // included angle (180=straight). Convert.
+    leftKnee: clamp(180 - Math.abs(p.joints.lKnee), 0, 180),
+    rightKnee: clamp(180 - Math.abs(p.joints.rKnee), 0, 180),
+    hipFlexion: clamp(p.tf, 0, 90),
+    leftShoulderAbduction: p.armAbducted ? 45 : 0,
+    rightShoulderAbduction: p.armAbducted ? 45 : 0,
+    leftForearmCross: p.laCross ? 16 : 0,
+    rightForearmCross: p.laCross ? 16 : 0,
+    _p2s: p,
   };
+
   _lastValidAngles = angles;
   return { angles, avgConfidence };
 }
 
 // ─── RULA CALCULATOR ─────────────────────────────────────────────────────────
+/**
+ * Map Manus's rich TaskProfile onto the validated engine's 3-tap inputs.
+ *   load: kg bucket → 0 light / 1 medium / 2 heavy (RULA & REBA force bands)
+ *   freq: +1 muscle-use (RULA) / activity (REBA) when posture is sustained
+ *         (duration not 'short') or repeated ≥4×/min
+ *   grip: coupling good→0, fair→1, poor→2
+ */
+function taskToP2STi(task: TaskProfile): P2STaskInputs {
+  const load = task.loadWeight >= 10 ? 2 : task.loadWeight >= 2 ? 1 : 0;
+  const freq = (task.repRate >= 4 || task.duration !== 'short') ? 1 : 0;
+  const grip = task.coupling === 'poor' ? 2 : task.coupling === 'fair' ? 1 : 0;
+  return { load, freq, grip };
+}
+
 export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: number): ScoreResult {
-  const a = angles;
-
-  // ── RULA Group A: Arm + Wrist ─────────────────────────────────────────────
-  // Upper arm elevation from torso vertical (degrees)
-  const ua = Math.max(a.leftUpperArm, a.rightUpperArm);
-  let upperArm = 1;
-  if (ua > 90) upperArm = 4;
-  else if (ua > 45) upperArm = 3;
-  else if (ua > 20) upperArm = 2;
-  // +1 if shoulder raised; +1 if arm abducted ≥45°; −1 if arm supported
-  if (Math.max(a.leftShoulderAbduction ?? 0, a.rightShoulderAbduction ?? 0) >= 45) upperArm += 1;
-  upperArm = Math.min(6, upperArm);
-
-  // Lower arm: 1 = 60–100° flexion, 2 = outside that range
-  const laWorst = Math.abs(a.leftLowerArm - 80) >= Math.abs(a.rightLowerArm - 80)
-    ? a.leftLowerArm : a.rightLowerArm;
-  let lowerArm = (laWorst >= 60 && laWorst <= 100) ? 1 : 2;
-  // +1 if forearm crosses midline or works out to side
-  if (Math.max(a.leftForearmCross ?? 0, a.rightForearmCross ?? 0) > 15) lowerArm = Math.min(2, lowerArm + 1);
-
-  // Wrist deviation from neutral (degrees)
-  // RULA worksheet: 1=0° (neutral), 2=0–15°, 3=>15°
-  const wr = Math.max(a.leftWrist, a.rightWrist);
-  let wrist = 1;
-  if (wr > 15) wrist = 3;
-  else if (wr > 0) wrist = 2;
-  // +1 if wrist bent from midline (ulnar/radial deviation)
-  // Approximate: if wrist score already elevated, add 1
-  const wristTwist = 1; // default mid-range; would need dedicated sensor for twist
-
-  // RULA Table A: 4D lookup [upperArm-1][lowerArm-1][wrist-1][wristTwist-1]
-  // Source: McAtamney & Corlett 1993, Table A (verified cell-by-cell)
-  const RULA_TABLE_A: number[][][][] = [
-    // UA=1
-    [[[1,2],[2,2],[2,3],[3,3]], [[2,2],[2,2],[3,3],[3,3]]],
-    // UA=2
-    [[[2,2],[2,3],[3,3],[3,4]], [[2,2],[2,3],[3,3],[3,4]]],
-    // UA=3
-    [[[2,3],[3,3],[3,4],[4,5]], [[2,3],[3,3],[3,4],[4,5]]],
-    // UA=4
-    [[[3,3],[3,4],[4,4],[5,5]], [[3,3],[3,4],[4,4],[5,5]]],
-    // UA=5
-    [[[4,4],[4,4],[4,5],[5,5]], [[4,4],[4,4],[4,5],[5,6]]],
-    // UA=6
-    [[[5,5],[5,5],[5,6],[6,7]], [[5,5],[5,5],[5,6],[6,7]]],
-  ];
-  const uaIdx = Math.min(5, upperArm - 1);
-  const laIdx = Math.min(1, lowerArm - 1);
-  const wrIdx = Math.min(3, wrist - 1);
-  const wtIdx = Math.min(1, wristTwist - 1);
-  const tableAScore = RULA_TABLE_A[uaIdx]?.[laIdx]?.[wrIdx]?.[wtIdx] ?? Math.min(7, upperArm + lowerArm + wrist);
-
-  // ── RULA Group B: Neck + Trunk + Legs ──────────────────────────────────────
-  // Neck: 1=0–10°, 2=10–20°, 3=>20°, 4=extension
-  let neck = 1;
-  if (a.neckFlexion > 20) neck = 3;
-  else if (a.neckFlexion > 10) neck = 2;
-  if (a.neckLateral > 10) neck = Math.min(6, neck + 1);
-
-  // Trunk: 1=upright/0–10°, 2=10–20°, 3=20–60°, 4=>60°
-  let trunk = 1;
-  if (a.trunkFlexion > 60) trunk = 4;
-  else if (a.trunkFlexion > 20) trunk = 3;
-  else if (a.trunkFlexion > 10) trunk = 2;
-  if (a.trunkLateral > 10) trunk = Math.min(5, trunk + 1);
-  if (a.trunkRotation > 15) trunk = Math.min(5, trunk + 1);
-
-  // Legs: 1=supported/balanced, 2=not supported
-  const legs = 1; // MediaPipe doesn't reliably detect unilateral stance
-
-  // RULA Table B: 3D lookup [neck-1][trunk-1][legs-1]
-  // Source: McAtamney & Corlett 1993, Table B (verified cell-by-cell)
-  const RULA_TABLE_B: number[][][] = [
-    // neck=1: trunk 1..5, legs 1..2
-    [[1,3],[2,3],[3,4],[5,5],[6,6]],
-    // neck=2
-    [[2,3],[2,3],[4,5],[5,5],[6,7]],
-    // neck=3
-    [[3,3],[3,4],[4,5],[5,6],[6,7]],
-    // neck=4
-    [[5,5],[5,6],[6,7],[7,7],[7,8]],
-    // neck=5
-    [[7,7],[7,7],[7,8],[8,8],[8,8]],
-    // neck=6
-    [[8,8],[8,8],[8,8],[8,9],[9,9]],
-  ];
-  const nkIdx = Math.min(5, neck - 1);
-  const trIdx = Math.min(4, trunk - 1);
-  const lgIdx = Math.min(1, legs - 1);
-  const tableBScore = RULA_TABLE_B[nkIdx]?.[trIdx]?.[lgIdx] ?? Math.min(7, neck + trunk + legs);
-
-  // Muscle use and force/load modifiers
-  const muscleScore = task.repRate > 4 ? 1 : 0;
-  const forceScore = task.loadWeight > 10 ? 3 : task.loadWeight > 2 ? 2 : 0;
-
-  const armWristScore = Math.min(9, Math.max(1, tableAScore + muscleScore + forceScore));
-  const neckTrunkScore = Math.min(9, Math.max(1, tableBScore + muscleScore + forceScore));
-
-  // RULA Table C — validated 7×7 lookup (McAtamney & Corlett 1993)
-  const RULA_TABLE_C: number[][] = [
-    [1, 2, 3, 3, 4, 5, 5], // aws=1
-    [2, 2, 3, 4, 4, 5, 5], // aws=2
-    [3, 3, 3, 4, 4, 5, 6], // aws=3
-    [3, 3, 3, 4, 5, 6, 6], // aws=4
-    [4, 4, 4, 5, 6, 7, 7], // aws=5
-    [4, 4, 5, 6, 6, 7, 7], // aws=6
-    [5, 5, 6, 6, 7, 7, 7], // aws=7
-  ];
-  const awsIdx = Math.min(6, armWristScore - 1);
-  const ntsIdx = Math.min(6, neckTrunkScore - 1);
-  const grandScore = RULA_TABLE_C[awsIdx][ntsIdx];
+  const p = angles._p2s;
+  if (!p) {
+    return {
+      score: 0, riskLevel: 'negligible', actionLevel: 0,
+      interpretation: 'No pose data for this frame.',
+      components: {}, confidence, notApplicable: true,
+    };
+  }
+  const r = p2sCalcRULA(p, taskToP2STi(task));
+  const grandScore = r.fs;
 
   let actionLevel = 1;
   if (grandScore >= 7) actionLevel = 4;
@@ -770,125 +594,32 @@ export function calcRULA(angles: BodyAngles, task: TaskProfile, confidence: numb
     riskLevel,
     actionLevel,
     interpretation: interpretations[grandScore] ?? 'Evaluate posture.',
-    components: { upperArm, lowerArm, wrist, neck, trunk, muscleScore, forceScore },
+    components: {
+      upperArm: r.ua, lowerArm: r.la, wrist: r.wr, neck: r.nk, trunk: r.tr, legs: r.lg,
+      armWristScore: r.wristArmScore, neckTrunkScore: r.neckTrunkLegScore,
+    },
     confidence,
   };
 }
 
 // ─── REBA CALCULATOR ─────────────────────────────────────────────────────────
 export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: number): ScoreResult {
-  const a = angles;
-
-  // Neck (REBA: 1 = 0–20°, 2 = >20° or extension)
-  // neckFlexion is now clamped to [0,90] so extension (negative) can't occur here.
-  let neck = 1;
-  if (a.neckFlexion > 20) neck = 2;
-  if (a.neckLateral > 10) neck += 1;
-
-  // Trunk (REBA Table A — floor is 1 for 0–10°, neutral upright = no penalty)
-  let trunk = 1;
-  if (a.trunkFlexion > 60) trunk = 4;
-  else if (a.trunkFlexion > 20) trunk = 3;
-  else if (a.trunkFlexion > 10) trunk = 2;
-  // 0–10° = 1 (neutral, no penalty)
-  if (a.trunkLateral > 10) trunk += 1;
-  if (a.trunkRotation > 15) trunk += 1;
-
-  // Legs (REBA Table A legs score 1–4)
-  // Knee angles are included angles: 180°=straight, <180°=bent.
-  // Use worst (most bent) knee.
-  const kneeAngle = Math.min(a.leftKnee, a.rightKnee);
-  let legs = 1; // bilateral weight-bearing, legs straight
-  if (kneeAngle < 150) legs = 2; // knee bent 30–60°
-  if (kneeAngle < 120) legs = 3; // knee bent >60°
-  // +1 if hip is flexed >60° (walking, stooping, one-legged stance)
-  if (a.hipFlexion > 60) legs = Math.min(4, legs + 1);
-
-  // Upper arm (REBA Table B)
-  const ua = Math.max(a.leftUpperArm, a.rightUpperArm);
-  let upperArm = 1;
-  if (ua > 90) upperArm = 4;
-  else if (ua > 45) upperArm = 3;
-  else if (ua > 20) upperArm = 2;
-  // +1 if shoulder is abducted ≥45°
-  if (Math.max(a.leftShoulderAbduction ?? 0, a.rightShoulderAbduction ?? 0) >= 45) upperArm += 1;
-
-  // Lower arm — use WORST arm (most deviated from 60-100° range)
-  const laWorstReba = Math.abs(a.leftLowerArm - 80) >= Math.abs(a.rightLowerArm - 80)
-    ? a.leftLowerArm : a.rightLowerArm;
-  const lowerArm = (laWorstReba >= 60 && laWorstReba <= 100) ? 1 : 2;
-
-  // Wrist
-  const wr = Math.max(a.leftWrist, a.rightWrist);
-  let wristScore = 1;
-  if (wr > 15) wristScore = 2;
-
-  // Load/force (+1 if load applied suddenly/shockingly)
-  const loadScore = task.loadWeight > 10 ? 3 : task.loadWeight > 5 ? 2 : task.loadWeight > 0 ? 1 : 0;
-  // Coupling
-  const couplingScore = { good: 0, fair: 1, poor: 2 }[task.coupling];
-  // Activity
-  const activityScore = task.repRate > 4 ? 1 : 0;
-
-  // REBA Table A: [neck-1][trunk-1][legs-1] — Hignett & McAtamney 2000
-  // neck: 1-3, trunk: 1-5, legs: 1-4
-  const REBA_TABLE_A: number[][][] = [
-    // neck=1: trunk 1..5, each with legs 1..4
-    [[1,2,3,4],[2,3,4,5],[2,4,5,6],[3,5,6,7],[4,6,7,8]],
-    // neck=2
-    [[1,3,4,5],[3,4,5,6],[3,5,6,7],[4,6,7,8],[5,7,8,9]],
-    // neck=3
-    [[3,3,5,6],[4,5,6,7],[5,6,7,8],[6,7,8,9],[6,8,9,9]],
-  ];
-  // REBA Table B (upperArm 1-6, lowerArm 1-2, wrist 1-3)
-  const REBA_TABLE_B: number[][][] = [
-    // lowerArm=1
-    [[1,2,2],[1,2,3],[3,4,5],[4,5,5],[6,7,8],[7,8,8]],
-    // lowerArm=2
-    [[1,2,3],[2,3,4],[4,5,5],[5,6,7],[7,8,8],[8,9,9]],
-  ];
-  // REBA Table C (scoreA 1-12, scoreB 1-12)
-  const REBA_TABLE_C: number[][] = [
-    [1, 1, 1, 2, 3, 3, 4, 5, 6, 7, 7, 7],
-    [1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 7, 8],
-    [2, 3, 3, 3, 4, 5, 6, 7, 7, 8, 8, 8],
-    [3, 4, 4, 4, 5, 6, 7, 8, 8, 9, 9, 9],
-    [4, 4, 4, 5, 6, 7, 8, 8, 9, 9,10,10],
-    [6, 6, 6, 7, 8, 8, 9, 9,10,10,11,11],
-    [7, 7, 7, 8, 9, 9, 9,10,11,11,11,12],
-    [8, 8, 8, 9,10,10,10,10,11,11,12,12],
-    [9, 9, 9,10,10,10,11,11,12,12,12,12],
-    [10,10,10,11,11,11,11,12,12,12,12,12],
-    [11,11,11,11,12,12,12,12,12,12,12,12],
-    [12,12,12,12,12,12,12,12,12,12,12,12],
-  ];
-
-  const neckIdx  = Math.min(2, neck - 1);
-  const trunkIdx = Math.min(4, trunk - 1);
-  const legsIdx  = Math.min(3, legs - 1);
-  const scoreA = REBA_TABLE_A[neckIdx]?.[trunkIdx]?.[legsIdx] ?? Math.min(12, neck + trunk + legs);
-
-  const uaIdx  = Math.min(5, upperArm - 1);
-  const laIdx  = Math.min(1, lowerArm - 1);
-  const wrIdx  = Math.min(2, wristScore - 1);
-  const scoreB = REBA_TABLE_B[laIdx]?.[uaIdx]?.[wrIdx] ?? Math.min(12, upperArm + lowerArm + wristScore);
-
-  const scAIdx = Math.min(11, (scoreA + loadScore + couplingScore) - 1);
-  const scBIdx = Math.min(11, scoreB - 1);
-  const scoreC = REBA_TABLE_C[scAIdx]?.[scBIdx] ?? Math.min(12, scoreA + scoreB);
-  const rebaScore = Math.min(15, scoreC + activityScore);
+  const p = angles._p2s;
+  if (!p) {
+    return {
+      score: 0, riskLevel: 'negligible', actionLevel: 0,
+      interpretation: 'No pose data for this frame.',
+      components: {}, confidence, notApplicable: true,
+    };
+  }
+  const r = p2sCalcREBA(p, taskToP2STi(task));
+  const rebaScore = r.fs;
 
   let actionLevel = 0;
   if (rebaScore >= 11) actionLevel = 4;
   else if (rebaScore >= 8) actionLevel = 3;
   else if (rebaScore >= 4) actionLevel = 2;
   else if (rebaScore >= 2) actionLevel = 1;
-
-  const riskLevel: RiskLevel =
-    rebaScore >= 11 ? 'very-high' :
-    rebaScore >= 8 ? 'high' :
-    rebaScore >= 4 ? 'medium' :
-    rebaScore >= 2 ? 'low' : 'negligible';
 
   const interpretations: Record<number, string> = {
     1: 'Negligible risk. No action required.',
@@ -904,12 +635,17 @@ export function calcREBA(angles: BodyAngles, task: TaskProfile, confidence: numb
     11: 'Very high risk. Implement changes immediately.',
   };
 
+  const riskLevel: RiskLevel = rebaScore >= 11 ? 'very-high' : rebaScore >= 8 ? 'high' : rebaScore >= 4 ? 'medium' : rebaScore >= 2 ? 'low' : 'negligible';
+
   return {
     score: rebaScore,
     riskLevel,
     actionLevel,
     interpretation: interpretations[Math.min(rebaScore, 11)] ?? 'Very high risk. Implement changes immediately.',
-    components: { neck, trunk, legs, upperArm, lowerArm, wristScore, loadScore, couplingScore, activityScore },
+    components: {
+      neck: r.nk, trunk: r.tr, legs: r.lg, upperArm: r.ua, lowerArm: r.la, wrist: r.wr,
+      postureScoreA: r.scoreA, postureScoreB: r.scoreB,
+    },
     confidence,
   };
 }
@@ -1064,8 +800,9 @@ export function computeSnapshot(
   smoothedLandmarks: Landmarks,
   task: TaskProfile,
   motionProfile?: MotionProfile,
+  isWorld: boolean = false,
 ): ErgoSnapshot | null {
-  const { angles: rawAngles, avgConfidence } = extractAngles(smoothedLandmarks);
+  const { angles: rawAngles, avgConfidence } = extractAngles(smoothedLandmarks, isWorld);
   if (avgConfidence < 0.3) return null; // not enough body visible
 
   // ITEM 4: Anatomical plausibility guard.

@@ -1,0 +1,54 @@
+# electron-builder.yml — ErgoKit Windows on-prem build
+#
+# Produces an offline Windows installer (NSIS) and a portable .exe. No code
+# signing / no auto-update (intentionally — air-gapped target, no update server).
+#
+# Build:  pnpm run dist:win
+# Output: release/ErgoKit-Setup-<version>.exe  and  release/ErgoKit-<version>-portable.exe
+
+appId: com.paligen.ergokit
+productName: ErgoKit
+copyright: © Paligen Technologies
+
+directories:
+  output: release
+  buildResources: build
+
+# What goes inside the asar. The Electron shell + the vite build output.
+files:
+  - electron/**/*
+  - from: dist/public
+    to: public
+    filter:
+      - '**/*'
+
+asar: true
+# The .task models + wasm are static assets already inside dist/public/mediapipe,
+# so they ride along in the asar. No extraResources needed.
+
+# Disable any network behavior from the builder/runtime.
+npmRebuild: false
+nodeGypRebuild: false
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  # icon: build/icon.ico   # add a 256x256 .ico at build/icon.ico before release
+
+nsis:
+  oneClick: false
+  perMachine: false                 # per-user install — no admin rights needed
+  allowToChangeInstallationDirectory: true
+  artifactName: ErgoKit-Setup-${version}.exe
+  shortcutName: ErgoKit
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+portable:
+  artifactName: ErgoKit-${version}-portable.exe
+
+# No publish provider — never attempts to contact an update/release server.
+publish: null
